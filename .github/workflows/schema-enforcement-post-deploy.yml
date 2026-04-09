@@ -1,0 +1,93 @@
+name: Schema Enforcement Post-Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: 'Target environment to enforce schemas on'
+        required: true
+        type: choice
+        options:
+          - dev
+          - uat
+          - prod
+      dry_run:
+        description: 'Dry run (report only, no changes)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  enforce-schema:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.target_environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get Fabric Access Token
+        id: token
+        run: |
+          TOKEN=$(curl -s -X POST \
+            "https://login.microsoftonline.com/${{ secrets.FABRIC_TENANT_ID }}/oauth2/v2.0/token" \
+            -d "client_id=${{ secrets.FABRIC_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.FABRIC_CLIENT_SECRET }}" \
+            -d "scope=https://api.fabric.microsoft.com/.default" \
+            -d "grant_type=client_credentials" | jq -r '.access_token')
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Resolve Workspace ID
+        id: workspace
+        run: |
+          ENV=${{ github.event.inputs.target_environment }}
+          WORKSPACE_ID=$(jq -r '.workspace_id' environments/${ENV}.json)
+          echo "workspace_id=$WORKSPACE_ID" >> $GITHUB_OUTPUT
+          echo "Target: $ENV (workspace: $WORKSPACE_ID)"
+
+      - name: Trigger Schema Enforcement Notebook
+        run: |
+          echo "Triggering 00_apply_schema notebook in ${{ github.event.inputs.target_environment }}..."
+
+          # Find the notebook item in the workspace
+          ITEMS=$(curl -s -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            "https://api.fabric.microsoft.com/v1/workspaces/${{ steps.workspace.outputs.workspace_id }}/items?type=Notebook")
+
+          NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_apply_schema") | .id')
+
+          if [ -z "$NOTEBOOK_ID" ]; then
+            echo "ERROR: 00_apply_schema notebook not found in workspace"
+            exit 1
+          fi
+
+          echo "Found notebook: $NOTEBOOK_ID"
+
+          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+            echo "DRY RUN: Would execute notebook $NOTEBOOK_ID"
+            echo "Schema registry version: $(grep SCHEMA_VERSION notebooks/00_schema_registry.py)"
+            exit 0
+          fi
+
+          # Execute the notebook via Fabric REST API
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            "https://api.fabric.microsoft.com/v1/workspaces/${{ steps.workspace.outputs.workspace_id }}/items/$NOTEBOOK_ID/jobs/instances?jobType=RunNotebook"
+
+          echo "Schema enforcement notebook triggered successfully"
+
+      - name: Trigger Quality Validation Notebook
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          echo "Triggering 03_data_quality_checks notebook..."
+
+          ITEMS=$(curl -s -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            "https://api.fabric.microsoft.com/v1/workspaces/${{ steps.workspace.outputs.workspace_id }}/items?type=Notebook")
+
+          QA_NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "03_data_quality_checks") | .id')
+
+          if [ -n "$QA_NOTEBOOK_ID" ]; then
+            curl -s -X POST \
+              -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+              -H "Content-Type: application/json" \
+              "https://api.fabric.microsoft.com/v1/workspaces/${{ steps.workspace.outputs.workspace_id }}/items/$QA_NOTEBOOK_ID/jobs/instances?jobType=RunNotebook"
+            echo "Quality validation triggered"
+          fi

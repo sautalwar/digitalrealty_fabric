@@ -1,0 +1,216 @@
+model DigitalRealty_Capacity
+  culture: en-US
+  defaultPowerBIDataSourceVersion: powerBI_V3
+  sourceQueryCulture: en-US
+
+  annotation PBI_QueryRelationships = [{"joinOnDateBehavior":"datePartOnly"}]
+
+  // ============================================================
+  // BEFORE: Unoptimized DirectLake model — DO NOT deploy to Prod
+  // Anti-patterns: calculated columns, SUMX/FILTER(ALL), bloat
+  // ============================================================
+
+  // DirectLake mode over Lakehouse silver tables
+  table silver_datacenters
+    lineageTag: dc-001
+    sourceLineageTag: [silver_datacenters]
+    dataCategory: Regular
+
+    column datacenter_id
+      dataType: string
+      isKey: true
+      sourceColumn: datacenter_id
+    column datacenter_name
+      dataType: string
+      sourceColumn: datacenter_name
+    column market
+      dataType: string
+      sourceColumn: market
+    column region
+      dataType: string
+      sourceColumn: region
+    column country
+      dataType: string
+      sourceColumn: country
+    column facility_type
+      dataType: string
+      sourceColumn: facility_type
+    column total_power_mw
+      dataType: double
+      sourceColumn: total_power_mw
+      formatString: #,##0.0
+    column it_power_mw
+      dataType: double
+      sourceColumn: it_power_mw
+      formatString: #,##0.0
+    column pue
+      dataType: double
+      sourceColumn: pue
+      formatString: #,##0.00
+    column efficiency_rating
+      dataType: string
+      sourceColumn: efficiency_rating
+    column status
+      dataType: string
+      sourceColumn: status
+    column opened_date
+      dataType: dateTime
+      sourceColumn: opened_date
+    column age_years
+      dataType: double
+      sourceColumn: age_years
+      formatString: #,##0.0
+    column tier_level
+      dataType: string
+      sourceColumn: tier_level
+
+    // ANTI-PATTERN 3: High-cardinality bloat columns — waste memory in DirectLake
+    column datacenter_description
+      dataType: string
+      sourceColumn: datacenter_description
+    column facility_notes
+      dataType: string
+      sourceColumn: facility_notes
+    column raw_api_response
+      dataType: string
+      sourceColumn: raw_api_response
+
+  table silver_capacity_trends
+    lineageTag: cap-001
+    sourceLineageTag: [silver_capacity_trends]
+
+    column capacity_id
+      dataType: string
+      isKey: true
+      sourceColumn: capacity_id
+    column datacenter_id
+      dataType: string
+      sourceColumn: datacenter_id
+    column measurement_date
+      dataType: dateTime
+      sourceColumn: measurement_date
+    column total_power_mw
+      dataType: double
+      sourceColumn: total_power_mw
+    column contracted_power_mw
+      dataType: double
+      sourceColumn: contracted_power_mw
+    column available_power_mw
+      dataType: double
+      sourceColumn: available_power_mw
+    column utilization_pct
+      dataType: double
+      sourceColumn: utilization_pct
+      formatString: #,##0.0"%"
+    column utilization_band
+      dataType: string
+      sourceColumn: utilization_band
+    column power_headroom_mw
+      dataType: double
+      sourceColumn: power_headroom_mw
+
+  table silver_customer_deployments
+    lineageTag: dep-001
+    sourceLineageTag: [silver_customer_deployments]
+
+    column deployment_id
+      dataType: string
+      isKey: true
+      sourceColumn: deployment_id
+    column customer_name
+      dataType: string
+      sourceColumn: customer_name
+    column datacenter_id
+      dataType: string
+      sourceColumn: datacenter_id
+    column contract_type
+      dataType: string
+      sourceColumn: contract_type
+    column power_kw
+      dataType: double
+      sourceColumn: power_kw
+    column power_mw
+      dataType: double
+      sourceColumn: power_mw
+    column monthly_revenue_usd
+      dataType: double
+      sourceColumn: monthly_revenue_usd
+      formatString: $#,##0
+    column annual_revenue_usd
+      dataType: double
+      sourceColumn: annual_revenue_usd
+      formatString: $#,##0
+    column renewal_risk
+      dataType: string
+      sourceColumn: renewal_risk
+    column connectivity_type
+      dataType: string
+      sourceColumn: connectivity_type
+
+    // ANTI-PATTERN 1: Calculated columns — should be measures
+    // These materialize a new column for every row, bloating the model
+    calculatedColumn 'Revenue per MW' = DIVIDE([monthly_revenue_usd], [power_mw], 0)
+    calculatedColumn 'Annual Revenue Calc' = [monthly_revenue_usd] * 12
+    calculatedColumn 'Is High Value' = IF([annual_revenue_usd] > 500000, "Yes", "No")
+
+    // ANTI-PATTERN 3: High-cardinality bloat columns — waste memory in DirectLake
+    column contract_notes
+      dataType: string
+      sourceColumn: contract_notes
+    column internal_etl_id
+      dataType: string
+      sourceColumn: internal_etl_id
+    column source_hash
+      dataType: string
+      sourceColumn: source_hash
+
+  // Relationships
+  relationship DC_to_Capacity
+    fromColumn: silver_capacity_trends.datacenter_id
+    toColumn: silver_datacenters.datacenter_id
+
+  relationship DC_to_Deployments
+    fromColumn: silver_customer_deployments.datacenter_id
+    toColumn: silver_datacenters.datacenter_id
+
+  // Measures
+  table _Measures
+    lineageTag: measures-001
+
+    measure 'Total Power MW' = SUM(silver_datacenters[total_power_mw])
+      formatString: #,##0.0" MW"
+
+    measure 'Avg Utilization %' = AVERAGE(silver_capacity_trends[utilization_pct])
+      formatString: #,##0.0"%"
+
+    measure 'Total Monthly Revenue' = SUM(silver_customer_deployments[monthly_revenue_usd])
+      formatString: $#,##0
+
+    measure 'Total Annual Revenue' = SUM(silver_customer_deployments[annual_revenue_usd])
+      formatString: $#,##0
+
+    measure 'Critical Utilization Sites' = COUNTROWS(FILTER(silver_capacity_trends, silver_capacity_trends[utilization_band] = "Critical"))
+
+    // ANTI-PATTERN 2: Inefficient DAX — SUMX row-by-row instead of SUM
+    measure 'Total Revenue Slow' = SUMX(silver_customer_deployments, silver_customer_deployments[monthly_revenue_usd])
+
+    // ANTI-PATTERN 2: FILTER(ALL(...)) ignores slicer context and scans full table
+    measure 'Active Datacenters' = COUNTROWS(FILTER(ALL(silver_datacenters), silver_datacenters[status] = "Active"))
+
+    // ANTI-PATTERN 2: CALCULATE + FILTER(ALL) — verbose and breaks filter context
+    measure 'High Risk Count' = CALCULATE(COUNTROWS(silver_customer_deployments), FILTER(ALL(silver_customer_deployments), silver_customer_deployments[renewal_risk] = "High"))
+
+    // ANTI-PATTERN 2: AVERAGEX row iteration instead of AVERAGE aggregation
+    measure 'Avg PUE Bad' = AVERAGEX(silver_datacenters, silver_datacenters[pue])
+
+    // ANTI-PATTERN 4: No formatString on measures above, no descriptions anywhere
+
+  // Row-Level Security
+  role NorthAmerica
+    tablePermission silver_datacenters = 'silver_datacenters'[region] = "NorthAmerica"
+
+  role EMEA
+    tablePermission silver_datacenters = 'silver_datacenters'[region] = "EMEA"
+
+  role APAC
+    tablePermission silver_datacenters = 'silver_datacenters'[region] = "APAC"

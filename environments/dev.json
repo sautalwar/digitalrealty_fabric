@@ -1,0 +1,12 @@
+{
+  "environment": "dev",
+  "workspace_name": "DigitalRealty_Dev",
+  "workspace_id": "<DEV_WORKSPACE_ID>",
+  "lakehouse_name": "DLR_Dev_Lakehouse",
+  "warehouse_name": "DLR_Dev_Warehouse",
+  "sql_endpoint": "<DEV_SQL_ENDPOINT>",
+  "filter_region": "ALL",
+  "git_branch": "main",
+  "notebook_schedule": "manual",
+  "notes": "Active development. Schema changes start here."
+}

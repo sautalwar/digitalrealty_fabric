@@ -1,0 +1,12 @@
+{
+  "environment": "prod",
+  "workspace_name": "DigitalRealty_Prod",
+  "workspace_id": "<PROD_WORKSPACE_ID>",
+  "lakehouse_name": "DLR_Prod_Lakehouse",
+  "warehouse_name": "DLR_Prod_Warehouse",
+  "sql_endpoint": "<PROD_SQL_ENDPOINT>",
+  "filter_region": "ALL",
+  "git_branch": "main",
+  "notebook_schedule": "daily_0400_utc",
+  "notes": "Production environment. Promoted from UAT with approval gate."
+}

@@ -1,0 +1,129 @@
+name: Promote with Schema Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_stage:
+        description: 'Source stage'
+        required: true
+        type: choice
+        options:
+          - Development
+          - UAT
+      target_stage:
+        description: 'Target stage'
+        required: true
+        type: choice
+        options:
+          - UAT
+          - Production
+
+concurrency:
+  group: fabric-promotion
+  cancel-in-progress: false
+
+jobs:
+  validate-and-promote:
+    runs-on: ubuntu-latest
+    environment: promotion-approval
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get Fabric Access Token
+        id: token
+        run: |
+          TOKEN=$(curl -s -X POST \
+            "https://login.microsoftonline.com/${{ secrets.FABRIC_TENANT_ID }}/oauth2/v2.0/token" \
+            -d "client_id=${{ secrets.FABRIC_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.FABRIC_CLIENT_SECRET }}" \
+            -d "scope=https://api.fabric.microsoft.com/.default" \
+            -d "grant_type=client_credentials" | jq -r '.access_token')
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Read Schema Version
+        id: schema
+        run: |
+          VERSION=$(grep 'SCHEMA_VERSION' notebooks/00_schema_registry.py | head -1 | cut -d'"' -f2)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Schema version: $VERSION"
+
+      - name: Pre-flight Schema Check
+        run: |
+          echo "============================================"
+          echo "Pre-flight Schema Validation"
+          echo "Schema version: ${{ steps.schema.outputs.version }}"
+          echo "Promotion: ${{ github.event.inputs.source_stage }} -> ${{ github.event.inputs.target_stage }}"
+          echo "============================================"
+
+          # Count expected tables from the schema registry
+          TABLE_COUNT=$(grep -c '"bronze_\|"silver_' notebooks/00_schema_registry.py)
+          echo "Schema registry defines $TABLE_COUNT tables"
+
+          # Validate schema registry syntax
+          python3 -c "
+          exec(open('notebooks/00_schema_registry.py').read())
+          print(f'Schema version: {SCHEMA_VERSION}')
+          print(f'Tables defined: {len(SCHEMAS)}')
+          for t, s in SCHEMAS.items():
+              print(f'  {t}: {len(s[\"columns\"])} columns')
+          "
+          echo "Schema registry validation passed"
+
+      - name: Deploy via Fabric Pipeline
+        run: |
+          echo "Deploying from ${{ github.event.inputs.source_stage }} to ${{ github.event.inputs.target_stage }}..."
+
+          PIPELINE_ID="${{ vars.DEPLOYMENT_PIPELINE_ID }}"
+
+          # Map stage names to stage order
+          case "${{ github.event.inputs.source_stage }}" in
+            "Development") SOURCE_ORDER=0 ;;
+            "UAT") SOURCE_ORDER=1 ;;
+          esac
+          case "${{ github.event.inputs.target_stage }}" in
+            "UAT") TARGET_ORDER=1 ;;
+            "Production") TARGET_ORDER=2 ;;
+          esac
+
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            "https://api.fabric.microsoft.com/v1/deploymentPipelines/$PIPELINE_ID/deploy" \
+            -d "{
+              \"sourceStageOrder\": $SOURCE_ORDER,
+              \"targetStageOrder\": $TARGET_ORDER,
+              \"isBackwardDeployment\": false,
+              \"newDeployment\": false,
+              \"note\": \"Schema v${{ steps.schema.outputs.version }} - promoted via GitHub Actions\"
+            }"
+
+          echo "Deployment triggered"
+
+      - name: Trigger Schema Enforcement in Target
+        run: |
+          echo "Triggering schema enforcement in ${{ github.event.inputs.target_stage }}..."
+
+          # Determine target workspace
+          case "${{ github.event.inputs.target_stage }}" in
+            "UAT") WS_ID="${{ vars.UAT_WORKSPACE_ID }}" ;;
+            "Production") WS_ID="${{ vars.PROD_WORKSPACE_ID }}" ;;
+          esac
+
+          # Find and execute schema enforcement notebook
+          ITEMS=$(curl -s -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Notebook")
+
+          NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_apply_schema") | .id')
+
+          if [ -n "$NOTEBOOK_ID" ]; then
+            curl -s -X POST \
+              -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+              -H "Content-Type: application/json" \
+              "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items/$NOTEBOOK_ID/jobs/instances?jobType=RunNotebook"
+            echo "Schema enforcement triggered in target workspace"
+          fi
+
+      - name: Tag Promotion
+        run: |
+          git tag "promote-${{ github.event.inputs.target_stage }}-schema-v${{ steps.schema.outputs.version }}-$(date +%Y%m%d%H%M)" || true
+          git push --tags || true

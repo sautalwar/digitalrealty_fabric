@@ -1,0 +1,10 @@
+[
+  {
+    "assignment_id": "digitalrealty-fabric-001",
+    "universe": "alien",
+    "timestamp": "2026-04-08T21:31:00Z",
+    "agent_count": 8,
+    "names_allocated": ["Dallas", "Ripley", "Parker", "Lambert", "Kane", "Brett", "Bishop", "Ash"],
+    "reason": "Initial team cast for Digital Realty Fabric demo project"
+  }
+]

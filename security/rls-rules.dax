@@ -1,0 +1,30 @@
+// Row-Level Security rules for the Digital Realty semantic model
+// Applied in the DirectLake semantic model to filter data by user region
+
+// Role: NorthAmerica
+// Members: na-analysts@digitalrealty.com
+[NorthAmerica] =
+VAR CurrentUser = USERPRINCIPALNAME()
+RETURN
+    [region] = "NorthAmerica"
+
+// Role: EMEA
+// Members: emea-analysts@digitalrealty.com
+[EMEA] =
+VAR CurrentUser = USERPRINCIPALNAME()
+RETURN
+    [region] = "EMEA"
+
+// Role: APAC
+// Members: apac-analysts@digitalrealty.com
+[APAC] =
+VAR CurrentUser = USERPRINCIPALNAME()
+RETURN
+    [region] = "APAC"
+
+// Role: LATAM
+// Members: latam-analysts@digitalrealty.com
+[LATAM] =
+VAR CurrentUser = USERPRINCIPALNAME()
+RETURN
+    [region] = "LATAM"

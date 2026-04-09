@@ -1,0 +1,202 @@
+model DigitalRealty_Capacity
+  culture: en-US
+  defaultPowerBIDataSourceVersion: powerBI_V3
+  sourceQueryCulture: en-US
+
+  annotation PBI_QueryRelationships = [{"joinOnDateBehavior":"datePartOnly"}]
+
+  // ============================================================
+  // AFTER: Optimized DirectLake model — production-ready
+  // No calc columns, efficient DAX, no bloat, all measures documented
+  // ============================================================
+
+  // DirectLake mode over Lakehouse silver tables
+  table silver_datacenters
+    lineageTag: dc-001
+    sourceLineageTag: [silver_datacenters]
+    dataCategory: Regular
+
+    column datacenter_id
+      dataType: string
+      isKey: true
+      sourceColumn: datacenter_id
+    column datacenter_name
+      dataType: string
+      sourceColumn: datacenter_name
+    column market
+      dataType: string
+      sourceColumn: market
+    column region
+      dataType: string
+      sourceColumn: region
+    column country
+      dataType: string
+      sourceColumn: country
+    column facility_type
+      dataType: string
+      sourceColumn: facility_type
+    column total_power_mw
+      dataType: double
+      sourceColumn: total_power_mw
+      formatString: #,##0.0
+    column it_power_mw
+      dataType: double
+      sourceColumn: it_power_mw
+      formatString: #,##0.0
+    column pue
+      dataType: double
+      sourceColumn: pue
+      formatString: #,##0.00
+    column efficiency_rating
+      dataType: string
+      sourceColumn: efficiency_rating
+    column status
+      dataType: string
+      sourceColumn: status
+    column opened_date
+      dataType: dateTime
+      sourceColumn: opened_date
+    column age_years
+      dataType: double
+      sourceColumn: age_years
+      formatString: #,##0.0
+    column tier_level
+      dataType: string
+      sourceColumn: tier_level
+
+  table silver_capacity_trends
+    lineageTag: cap-001
+    sourceLineageTag: [silver_capacity_trends]
+
+    column capacity_id
+      dataType: string
+      isKey: true
+      sourceColumn: capacity_id
+    column datacenter_id
+      dataType: string
+      sourceColumn: datacenter_id
+      isAvailableInMDX: false
+    column measurement_date
+      dataType: dateTime
+      sourceColumn: measurement_date
+    column total_power_mw
+      dataType: double
+      sourceColumn: total_power_mw
+    column contracted_power_mw
+      dataType: double
+      sourceColumn: contracted_power_mw
+    column available_power_mw
+      dataType: double
+      sourceColumn: available_power_mw
+    column utilization_pct
+      dataType: double
+      sourceColumn: utilization_pct
+      formatString: #,##0.0"%"
+    column utilization_band
+      dataType: string
+      sourceColumn: utilization_band
+    column power_headroom_mw
+      dataType: double
+      sourceColumn: power_headroom_mw
+
+  table silver_customer_deployments
+    lineageTag: dep-001
+    sourceLineageTag: [silver_customer_deployments]
+
+    column deployment_id
+      dataType: string
+      isKey: true
+      sourceColumn: deployment_id
+    column customer_name
+      dataType: string
+      sourceColumn: customer_name
+    column datacenter_id
+      dataType: string
+      sourceColumn: datacenter_id
+      isAvailableInMDX: false
+    column contract_type
+      dataType: string
+      sourceColumn: contract_type
+    column power_kw
+      dataType: double
+      sourceColumn: power_kw
+    column power_mw
+      dataType: double
+      sourceColumn: power_mw
+    column monthly_revenue_usd
+      dataType: double
+      sourceColumn: monthly_revenue_usd
+      formatString: $#,##0
+    column annual_revenue_usd
+      dataType: double
+      sourceColumn: annual_revenue_usd
+      formatString: $#,##0
+    column renewal_risk
+      dataType: string
+      sourceColumn: renewal_risk
+    column connectivity_type
+      dataType: string
+      sourceColumn: connectivity_type
+
+  // Relationships
+  relationship DC_to_Capacity
+    fromColumn: silver_capacity_trends.datacenter_id
+    toColumn: silver_datacenters.datacenter_id
+
+  relationship DC_to_Deployments
+    fromColumn: silver_customer_deployments.datacenter_id
+    toColumn: silver_datacenters.datacenter_id
+
+  // Measures — all with formatString + description
+  table _Measures
+    lineageTag: measures-001
+
+    measure 'Total Power MW' = SUM(silver_datacenters[total_power_mw])
+      formatString: #,##0.0" MW"
+      description: "Total power capacity across all datacenters"
+
+    measure 'Avg Utilization %' = AVERAGE(silver_capacity_trends[utilization_pct])
+      formatString: #,##0.0"%"
+      description: "Average capacity utilization across all sites"
+
+    measure 'Total Monthly Revenue' = SUM(silver_customer_deployments[monthly_revenue_usd])
+      formatString: $#,##0
+      description: "Sum of monthly recurring revenue"
+
+    measure 'Total Annual Revenue' = SUM(silver_customer_deployments[annual_revenue_usd])
+      formatString: $#,##0
+      description: "Sum of annual contract revenue"
+
+    measure 'Avg PUE' = AVERAGE(silver_datacenters[pue])
+      formatString: #,##0.00
+      description: "Average Power Usage Effectiveness rating"
+
+    measure 'Active Datacenters' = CALCULATE(COUNTROWS(silver_datacenters), silver_datacenters[status] = "Active")
+      description: "Count of datacenters with Active status"
+
+    measure 'High Risk Renewals' = CALCULATE(COUNTROWS(silver_customer_deployments), silver_customer_deployments[renewal_risk] = "High")
+      description: "Contracts flagged as high risk for non-renewal"
+
+    measure 'Critical Utilization Sites' = CALCULATE(COUNTROWS(silver_capacity_trends), silver_capacity_trends[utilization_band] = "Critical")
+      description: "Sites with critical capacity utilization"
+
+    measure 'Revenue per MW' = DIVIDE(SUM(silver_customer_deployments[monthly_revenue_usd]), SUM(silver_customer_deployments[power_mw]), 0)
+      formatString: $#,##0
+      description: "Monthly revenue per megawatt of contracted power"
+
+    measure 'Annual Revenue Projected' = [Total Monthly Revenue] * 12
+      formatString: $#,##0
+      description: "Projected annual revenue based on current monthly revenue"
+
+    measure 'High Value Customers' = CALCULATE(COUNTROWS(silver_customer_deployments), silver_customer_deployments[annual_revenue_usd] > 500000)
+      description: "Count of customers with annual revenue exceeding $500K"
+
+  // Row-Level Security
+  role NorthAmerica
+    tablePermission silver_datacenters = 'silver_datacenters'[region] = "NorthAmerica"
+
+  role EMEA
+    tablePermission silver_datacenters = 'silver_datacenters'[region] = "EMEA"
+
+  role APAC
+    tablePermission silver_datacenters = 'silver_datacenters'[region] = "APAC"

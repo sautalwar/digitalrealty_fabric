@@ -1,0 +1,20 @@
+{
+  "pipeline_name": "DigitalRealty-DevToUATToProd",
+  "stages": [
+    {
+      "stage_name": "Development",
+      "stage_order": 0,
+      "workspace_name": "DigitalRealty_Dev"
+    },
+    {
+      "stage_name": "UAT",
+      "stage_order": 1,
+      "workspace_name": "DigitalRealty_UAT"
+    },
+    {
+      "stage_name": "Production",
+      "stage_order": 2,
+      "workspace_name": "DigitalRealty_Prod"
+    }
+  ]
+}

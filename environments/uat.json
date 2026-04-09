@@ -1,0 +1,12 @@
+{
+  "environment": "uat",
+  "workspace_name": "DigitalRealty_UAT",
+  "workspace_id": "<UAT_WORKSPACE_ID>",
+  "lakehouse_name": "DLR_UAT_Lakehouse",
+  "warehouse_name": "DLR_UAT_Warehouse",
+  "sql_endpoint": "<UAT_SQL_ENDPOINT>",
+  "filter_region": "EMEA",
+  "git_branch": "main",
+  "notebook_schedule": "daily_0600_utc",
+  "notes": "User acceptance testing. Promoted from Dev via deployment pipeline."
+}

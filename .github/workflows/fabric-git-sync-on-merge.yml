@@ -1,0 +1,54 @@
+name: Fabric Git Sync on Merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+jobs:
+  sync-fabric:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get Fabric Access Token
+        id: token
+        run: |
+          TOKEN=$(curl -s -X POST \
+            "https://login.microsoftonline.com/${{ secrets.FABRIC_TENANT_ID }}/oauth2/v2.0/token" \
+            -d "client_id=${{ secrets.FABRIC_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.FABRIC_CLIENT_SECRET }}" \
+            -d "scope=https://api.fabric.microsoft.com/.default" \
+            -d "grant_type=client_credentials" | jq -r '.access_token')
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Check Git Sync Status
+        id: status
+        run: |
+          STATUS=$(curl -s -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            "https://api.fabric.microsoft.com/v1/workspaces/${{ vars.DEV_WORKSPACE_ID }}/git/status")
+          echo "Git sync status: $STATUS"
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+
+      - name: Sync Workspace from Git
+        run: |
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            "https://api.fabric.microsoft.com/v1/workspaces/${{ vars.DEV_WORKSPACE_ID }}/git/updateFromGit" \
+            -d '{
+              "remoteCommitHash": "'${{ github.sha }}'",
+              "conflictResolution": { "conflictResolutionType": "Workspace", "conflictResolutionPolicy": "PreferRemote" },
+              "options": { "allowOverrideItems": true }
+            }'
+          echo "Git sync triggered for Dev workspace"
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `Fabric Git Sync triggered for Dev workspace.\nCommit: ${context.sha}\n\nNext: Run schema enforcement notebooks, then promote via deployment pipeline.`
+            })

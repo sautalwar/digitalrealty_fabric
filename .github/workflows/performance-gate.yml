@@ -1,0 +1,169 @@
+name: Performance Gate — BPA + Memory + Schema
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'semantic-model/**'
+      - 'notebooks/**'
+      - 'migrations/**'
+  workflow_dispatch:
+    inputs:
+      workspace:
+        description: 'Target workspace'
+        default: 'DigitalRealty_Dev'
+        type: string
+
+env:
+  FABRIC_API: https://api.fabric.microsoft.com/v1
+
+jobs:
+  # Job 1: Static TMDL Analysis (no Fabric connection needed)
+  tmdl-lint:
+    name: TMDL Anti-Pattern Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check for calculated columns
+        id: calc-cols
+        run: |
+          echo "=== Scanning TMDL for calculated columns ==="
+          CALC_COLS=$(grep -c "calculatedColumn" semantic-model/*.tmdl 2>/dev/null || echo "0")
+          echo "Found: $CALC_COLS calculated columns"
+          if [ "$CALC_COLS" -gt "0" ]; then
+            echo "::warning::Found $CALC_COLS calculated columns — consider converting to measures"
+            grep -n "calculatedColumn" semantic-model/*.tmdl || true
+          fi
+          echo "calc_col_count=$CALC_COLS" >> $GITHUB_OUTPUT
+      
+      - name: Check for inefficient DAX patterns
+        run: |
+          echo "=== Scanning for known DAX anti-patterns ==="
+          ISSUES=0
+          
+          # Check for SUMX where SUM would work
+          SUMX_COUNT=$(grep -c "SUMX(" semantic-model/*.tmdl 2>/dev/null || echo "0")
+          if [ "$SUMX_COUNT" -gt "0" ]; then
+            echo "::warning::Found $SUMX_COUNT uses of SUMX — verify these can't use SUM instead"
+            grep -n "SUMX(" semantic-model/*.tmdl || true
+            ISSUES=$((ISSUES + SUMX_COUNT))
+          fi
+          
+          # Check for FILTER(ALL(...)) pattern
+          FILTER_ALL=$(grep -c "FILTER(ALL(" semantic-model/*.tmdl 2>/dev/null || echo "0")
+          if [ "$FILTER_ALL" -gt "0" ]; then
+            echo "::error::Found $FILTER_ALL uses of FILTER(ALL()) — replace with CALCULATE + REMOVEFILTERS"
+            grep -n "FILTER(ALL(" semantic-model/*.tmdl || true
+            ISSUES=$((ISSUES + FILTER_ALL))
+          fi
+          
+          # Check for AVERAGEX where AVERAGE works
+          AVERAGEX_COUNT=$(grep -c "AVERAGEX(" semantic-model/*.tmdl 2>/dev/null || echo "0")
+          if [ "$AVERAGEX_COUNT" -gt "0" ]; then
+            echo "::warning::Found $AVERAGEX_COUNT uses of AVERAGEX — verify these can't use AVERAGE"
+            grep -n "AVERAGEX(" semantic-model/*.tmdl || true
+            ISSUES=$((ISSUES + AVERAGEX_COUNT))
+          fi
+          
+          echo ""
+          echo "Total DAX issues: $ISSUES"
+          if [ "$ISSUES" -gt "5" ]; then
+            echo "::error::Too many DAX anti-patterns ($ISSUES). Please optimize before merging."
+            exit 1
+          fi
+      
+      - name: Check for missing format strings
+        run: |
+          echo "=== Checking measure format strings ==="
+          MEASURES=$(grep -c "measure " semantic-model/*.tmdl 2>/dev/null || echo "0")
+          FORMATTED=$(grep -c "formatString:" semantic-model/*.tmdl 2>/dev/null || echo "0")
+          echo "Measures: $MEASURES, With formatString: $FORMATTED"
+          MISSING=$((MEASURES - FORMATTED))
+          if [ "$MISSING" -gt "2" ]; then
+            echo "::warning::$MISSING measures missing formatString"
+          fi
+      
+      - name: Check for high-cardinality bloat columns
+        run: |
+          echo "=== Checking for known bloat column patterns ==="
+          BLOAT_PATTERNS=("description" "notes" "raw_" "_hash" "_etl_" "response")
+          FOUND=0
+          for pattern in "${BLOAT_PATTERNS[@]}"; do
+            COUNT=$(grep -ci "$pattern" semantic-model/*.tmdl 2>/dev/null || echo "0")
+            if [ "$COUNT" -gt "0" ]; then
+              echo "::warning::Found columns matching bloat pattern '$pattern' ($COUNT occurrences)"
+              FOUND=$((FOUND + COUNT))
+            fi
+          done
+          echo "Potential bloat columns: $FOUND"
+
+  # Job 2: Schema Validation
+  schema-check:
+    name: Schema Registry Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Validate schema registry syntax
+        run: |
+          python -c "
+          import ast, sys
+          try:
+              with open('notebooks/00_schema_registry.py') as f:
+                  content = f.read()
+              # Extract SCHEMAS dict
+              tree = ast.parse(content)
+              print('Schema registry: syntax OK')
+              
+              # Check for SCHEMA_VERSION
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Assign):
+                      for target in node.targets:
+                          if hasattr(target, 'id') and target.id == 'SCHEMA_VERSION':
+                              print(f'Schema version found: {ast.literal_eval(node.value)}')
+              
+              print('Schema registry validation: PASSED')
+          except Exception as e:
+              print(f'Schema registry validation: FAILED - {e}')
+              sys.exit(1)
+          "
+      
+      - name: Check migration file naming
+        run: |
+          echo "=== Validating migration file naming convention ==="
+          for f in migrations/V*.py; do
+            if [[ "$f" =~ ^migrations/V[0-9]{3}__[a-z_]+\.py$ ]]; then
+              echo "  ✓ $f"
+            else
+              echo "  ✗ $f — does not match V###__description.py pattern"
+              exit 1
+            fi
+          done
+          echo "Migration naming: PASSED"
+
+  # Job 3: Combined Gate Decision
+  gate-decision:
+    name: Performance Gate Decision
+    needs: [tmdl-lint, schema-check]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate result
+        run: |
+          echo "============================================"
+          echo "  PERFORMANCE GATE RESULTS"
+          echo "============================================"
+          echo "  TMDL Anti-Pattern Scan:  ✓ PASSED"
+          echo "  Schema Validation:       ✓ PASSED"
+          echo "============================================"
+          echo ""
+          echo "  All gates passed. Safe to deploy."
+          echo ""
+          echo "  Note: Runtime checks (BPA via semantic-link-labs,"
+          echo "  Memory Analyzer, Compression Analyzer) run"
+          echo "  post-deploy in the Fabric notebook pipeline."

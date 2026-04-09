@@ -1,0 +1,40 @@
+{
+  "roles": [
+    {
+      "name": "NorthAmerica_ReadAll",
+      "description": "Read access to North America datacenter data",
+      "members": ["na-analysts@digitalrealty.com"],
+      "permissions": {
+        "tables": ["silver_datacenters", "silver_capacity_trends", "silver_customer_deployments"],
+        "filter": "region = 'NorthAmerica'"
+      }
+    },
+    {
+      "name": "EMEA_ReadAll",
+      "description": "Read access to EMEA datacenter data",
+      "members": ["emea-analysts@digitalrealty.com"],
+      "permissions": {
+        "tables": ["silver_datacenters", "silver_capacity_trends", "silver_customer_deployments"],
+        "filter": "region = 'EMEA'"
+      }
+    },
+    {
+      "name": "APAC_ReadAll",
+      "description": "Read access to APAC datacenter data",
+      "members": ["apac-analysts@digitalrealty.com"],
+      "permissions": {
+        "tables": ["silver_datacenters", "silver_capacity_trends", "silver_customer_deployments"],
+        "filter": "region = 'APAC'"
+      }
+    },
+    {
+      "name": "Global_Admin",
+      "description": "Full read access to all regions",
+      "members": ["platform-admins@digitalrealty.com"],
+      "permissions": {
+        "tables": ["*"],
+        "filter": null
+      }
+    }
+  ]
+}

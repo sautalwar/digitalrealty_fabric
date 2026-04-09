@@ -1,0 +1,34 @@
+{
+  "rules": [
+    {
+      "artifact_type": "Lakehouse",
+      "source_stage": "Development",
+      "target_stage": "UAT",
+      "rules": [
+        {
+          "type": "parameter",
+          "parameter_name": "lakehouse_name",
+          "source_value": "DLR_Dev_Lakehouse",
+          "target_value": "DLR_UAT_Lakehouse"
+        }
+      ]
+    },
+    {
+      "artifact_type": "Lakehouse",
+      "source_stage": "UAT",
+      "target_stage": "Production",
+      "rules": [
+        {
+          "type": "parameter",
+          "parameter_name": "lakehouse_name",
+          "source_value": "DLR_UAT_Lakehouse",
+          "target_value": "DLR_Prod_Lakehouse"
+        }
+      ]
+    },
+    {
+      "artifact_type": "Notebook",
+      "note": "Notebooks are promoted as-is. Schema definitions travel with the code. The schema enforcer (00_apply_schema.py) handles environment-specific schema application at runtime."
+    }
+  ]
+}
