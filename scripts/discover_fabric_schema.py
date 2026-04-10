@@ -134,6 +134,21 @@ def list_tables_via_dfs(ws_id, lh_id, directory="Tables"):
         return []
 
 
+def list_schema_aware_tables(ws_id, lh_id):
+    """Two-level DFS listing for schema-enabled lakehouses: Tables/{schema}/{table}.
+
+    Returns (table_list, schema_name) where table_list is a list of {"name": ...}
+    dicts and schema_name is the first schema found with tables.
+    """
+    schema_dirs = list_tables_via_dfs(ws_id, lh_id)
+    for sd in schema_dirs:
+        sname = sd["name"]
+        sub_tables = list_tables_via_dfs(ws_id, lh_id, f"Tables/{sname}")
+        if sub_tables:
+            return sub_tables, sname
+    return [], "dbo"
+
+
 def onelake_read(ws_id, lh_id, relative_path):
     """Read a file from OneLake DFS API. Requires STORAGE_TOKEN scope."""
     if not STORAGE_TOKEN:
@@ -227,16 +242,7 @@ for candidate in candidates:
     if err_code == "UnsupportedOperationForSchemasEnabledLakehouse":
         schemas_enabled = True
         print(f"  ℹ️  Schema-enabled lakehouse — using DFS schema-aware listing")
-        # First level: list schema folders under Tables/
-        schema_dirs = list_tables_via_dfs(WORKSPACE_ID, cid)
-        for sd in schema_dirs:
-            sname = sd["name"]
-            # Second level: list table folders under Tables/{schema}/
-            sub_tables = list_tables_via_dfs(WORKSPACE_ID, cid, f"Tables/{sname}")
-            if sub_tables:
-                default_schema = sname
-                tbl_list = sub_tables
-                break
+        tbl_list, default_schema = list_schema_aware_tables(WORKSPACE_ID, cid)
     else:
         tbl_list = tables_check.get("data", []) or tables_check.get("value", [])
         if not tbl_list:
@@ -262,15 +268,7 @@ print(f"✅ Lakehouse: {LH_NAME} ({LH_ID})")
 # 2. List tables — schema-enabled uses DFS, others try Lakehouse Tables API first
 if schemas_enabled:
     print(f"📋 Schema-enabled lakehouse — listing via DFS (schema: {default_schema})")
-    tables = []
-    schema_dirs = list_tables_via_dfs(WORKSPACE_ID, LH_ID)
-    for sd in schema_dirs:
-        sname = sd["name"]
-        sub = list_tables_via_dfs(WORKSPACE_ID, LH_ID, f"Tables/{sname}")
-        if sub:
-            default_schema = sname
-            tables = sub
-            break
+    tables, default_schema = list_schema_aware_tables(WORKSPACE_ID, LH_ID)
     print(f"📋 DFS schema-aware listing: {len(tables)} table(s) (schema: {default_schema})")
 else:
     tables_resp = fabric_get(f"/workspaces/{WORKSPACE_ID}/lakehouses/{LH_ID}/tables")

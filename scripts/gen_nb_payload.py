@@ -83,7 +83,7 @@ if has_source:
         '    print(f"Runtime discovery: {len(TABLES)} tables found in Dev OneLake")\n'
         "    if not TABLES and not SCHEMAS_ENABLED:\n"
         "        # Maybe it is actually schema-enabled — try with dbo/\n"
-        '        alt_path = f"{dev_base_path}/dbo"\n'
+        '        alt_path = f"{dev_base_path}/{DEFAULT_SCHEMA}"\n'
         "        try:\n"
         "            entries = mssparkutils.fs.ls(alt_path)\n"
         "            TABLES = [e.name.rstrip('/') for e in entries if e.isDir]\n"
@@ -96,7 +96,7 @@ if has_source:
         "except Exception as _e:\n"
         '    print(f"Runtime discovery failed ({_e}), trying fallback...")\n'
         "    try:\n"
-        '        alt_path = f"{dev_base_path}/dbo" if not SCHEMAS_ENABLED else dev_base_path\n'
+        '        alt_path = f"{dev_base_path}/{DEFAULT_SCHEMA}" if not SCHEMAS_ENABLED else dev_base_path\n'
         "        entries = mssparkutils.fs.ls(alt_path)\n"
         "        TABLES = [e.name.rstrip('/') for e in entries if e.isDir]\n"
         "        if TABLES:\n"
