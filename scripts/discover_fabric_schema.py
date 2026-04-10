@@ -141,7 +141,7 @@ def _is_delta_table_dir(ws_id, lh_id, directory):
 
 
 # Directories under Tables/ that are NOT schema names — skip during schema discovery
-_NON_SCHEMA_DIRS = {"Files", "_delta_log", "_schemas", "__checkpoint", "_temporary"}
+_NON_SCHEMA_DIRS = {"Files", "_delta_log", "_schemas", "__checkpoint", "_temporary", "TableMaintenance", "Tables"}
 
 
 def list_schema_aware_tables(ws_id, lh_id):
@@ -161,6 +161,12 @@ def list_schema_aware_tables(ws_id, lh_id):
         if sd["name"] not in _NON_SCHEMA_DIRS and not sd["name"].startswith("_")
     ]
     print(f"  Schema candidates (after filtering): {schema_names}")
+
+    # Always include 'dbo' even if it didn't appear in the DFS listing —
+    # schema-enabled lakehouses may not surface it at the top level.
+    if "dbo" not in schema_names:
+        print("  ℹ️  'dbo' not in listing — adding explicitly (Fabric default schema)")
+        schema_names.append("dbo")
 
     # Try 'dbo' first (Fabric default schema), then the rest
     ordered = sorted(schema_names, key=lambda s: (0 if s == "dbo" else 1, s))

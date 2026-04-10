@@ -380,13 +380,29 @@ jobs:
             echo "▶  DRY RUN — would sync UAT workspace from Git"
             echo "✅  Dry run complete"
           else
-            # ── Step 1: Trigger Git sync on UAT workspace ──────────────────
+            # ── Step 1: Get Git status for proper commit hashes ────────────
+            echo "🔍 Getting Git status for UAT workspace ($UAT_WS)..."
+            GIT_STATUS=$(curl -s \
+              -H "Authorization: Bearer $TOKEN" \
+              "https://api.fabric.microsoft.com/v1/workspaces/$UAT_WS/git/status")
+            REMOTE_HASH=$(echo "$GIT_STATUS" | jq -r '.remoteCommitHash // empty' 2>/dev/null)
+            WS_HEAD=$(echo "$GIT_STATUS" | jq -r '.workspaceHead // empty' 2>/dev/null)
+            echo "   Remote commit hash : ${REMOTE_HASH:-<not available>}"
+            echo "   Workspace head     : ${WS_HEAD:-<not available>}"
+
+            # ── Step 2: Trigger Git sync on UAT workspace ──────────────────
+            echo ""
             echo "🔄 Triggering Git sync on UAT workspace ($UAT_WS)..."
+            SYNC_BODY_JSON="{\"remoteCommitHash\": \"${REMOTE_HASH}\", \"workspaceHead\": \"${WS_HEAD}\", \"conflictResolution\": {\"conflictResolutionType\": \"Workspace\", \"conflictResolutionPolicy\": \"PreferRemote\"}, \"options\": {\"allowOverrideItems\": true}}"
+            if [ -z "$REMOTE_HASH" ] || [ -z "$WS_HEAD" ]; then
+              echo "   ⚠️  Could not get commit hashes from Git status — using null fallback"
+              SYNC_BODY_JSON='{"remoteCommitHash": null, "workspaceHead": null, "conflictResolution": {"conflictResolutionType": "Workspace", "conflictResolutionPolicy": "PreferRemote"}, "options": {"allowOverrideItems": true}}'
+            fi
             SYNC_RESP=$(curl -s -w "\n%{http_code}" -X POST \
               -H "Authorization: Bearer $TOKEN" \
               -H "Content-Type: application/json" \
               "https://api.fabric.microsoft.com/v1/workspaces/$UAT_WS/git/updateFromGit" \
-              -d '{"workspaceHead": null, "remoteCommitHash": null, "conflictResolution": {"conflictResolutionType": "Workspace", "conflictResolutionPolicy": "PreferRemote"}, "options": {"allowOverrideItems": true}}')
+              -d "$SYNC_BODY_JSON")
             SYNC_HTTP=$(echo "$SYNC_RESP" | tail -1)
             SYNC_BODY=$(echo "$SYNC_RESP" | head -n -1)
             echo "   Git sync response: HTTP $SYNC_HTTP"
@@ -402,16 +418,68 @@ jobs:
                   S=$(curl -s -H "Authorization: Bearer $TOKEN" "$OP_URL" | jq -r '.status // "Unknown"' 2>/dev/null)
                   echo "   Poll $i: $S"
                   [ "$S" = "Succeeded" ] && echo "✅ Git sync completed" && break
-                  [ "$S" = "Failed"    ] && echo "⚠️  Git sync failed — schema enforcer will still run" && break
+                  [ "$S" = "Failed"    ] && echo "⚠️  Git sync failed — Deployment Pipeline will handle promotion" && break
                 done
               fi
             else
               echo "⚠️  Git sync returned HTTP $SYNC_HTTP"
               echo "   Body: $SYNC_BODY"
-              echo "   This workspace may not be connected to Git — schema enforcer will create tables directly"
+              echo "   Deployment Pipeline will handle promotion in the next step"
             fi
 
-            # ── Step 2: List Dev Lakehouse tables as inventory (informational) ──
+            # ── Step 3: Deploy via Fabric Deployment Pipeline API ──────────
+            PIPELINE_ID="${{ vars.DEPLOYMENT_PIPELINE_ID }}"
+            if [ -n "$PIPELINE_ID" ]; then
+              echo ""
+              echo "🚀 Triggering Fabric Deployment Pipeline ($PIPELINE_ID)..."
+              echo "   Deploying from $SOURCE (stage 0) → $TARGET (stage 1)"
+
+              # Map stage names to stage order (Development=0, Test/UAT=1, Production=2)
+              SOURCE_STAGE_ORDER=0
+              TARGET_STAGE_ORDER=1
+
+              DEPLOY_RESP=$(curl -s -w "\n%{http_code}" -X POST \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Content-Type: application/json" \
+                "https://api.fabric.microsoft.com/v1/deploymentPipelines/$PIPELINE_ID/deploy" \
+                -d "{\"sourceStageOrder\": $SOURCE_STAGE_ORDER, \"isBackwardDeployment\": false, \"newWorkspace\": false, \"options\": {\"allowOverrideItems\": true, \"allowCreateNewArtifact\": true, \"allowPurgeData\": false}}")
+              DEPLOY_HTTP=$(echo "$DEPLOY_RESP" | tail -1)
+              DEPLOY_BODY=$(echo "$DEPLOY_RESP" | head -n -1)
+              echo "   Deployment Pipeline response: HTTP $DEPLOY_HTTP"
+
+              if [ "$DEPLOY_HTTP" = "200" ] || [ "$DEPLOY_HTTP" = "202" ]; then
+                echo "⏳ Deployment started — polling for completion..."
+                DEPLOY_OP_URL=$(echo "$DEPLOY_BODY" | jq -r '.url // empty' 2>/dev/null)
+                if [ -z "$DEPLOY_OP_URL" ]; then
+                  # Try Location header pattern
+                  DEPLOY_OP_ID=$(echo "$DEPLOY_BODY" | jq -r '.id // empty' 2>/dev/null)
+                  if [ -n "$DEPLOY_OP_ID" ]; then
+                    DEPLOY_OP_URL="https://api.fabric.microsoft.com/v1/deploymentPipelines/$PIPELINE_ID/operations/$DEPLOY_OP_ID"
+                  fi
+                fi
+                if [ -n "$DEPLOY_OP_URL" ]; then
+                  for i in $(seq 1 30); do
+                    sleep 10
+                    DS=$(curl -s -H "Authorization: Bearer $TOKEN" "$DEPLOY_OP_URL" | jq -r '.status // "Unknown"' 2>/dev/null)
+                    echo "   Poll $i: $DS"
+                    [ "$DS" = "Succeeded" ] && echo "✅ Deployment Pipeline completed successfully" && break
+                    [ "$DS" = "Failed"    ] && echo "⚠️  Deployment Pipeline failed — check Fabric portal" && break
+                  done
+                else
+                  echo "   (no operation URL returned — check portal for deployment status)"
+                fi
+              else
+                echo "⚠️  Deployment Pipeline returned HTTP $DEPLOY_HTTP"
+                echo "   Body: $DEPLOY_BODY"
+                echo "   Schema enforcer will create tables directly via notebook"
+              fi
+            else
+              echo ""
+              echo "⚠️  DEPLOYMENT_PIPELINE_ID not set — skipping Deployment Pipeline"
+              echo "   Set vars.DEPLOYMENT_PIPELINE_ID in GitHub repo settings to enable"
+            fi
+
+            # ── Step 4: List Dev Lakehouse tables as inventory (informational) ──
             DEV_WS="ffb373f3-c810-453a-b598-badb52dfd152"
             DEV_LH="11fedcf0-74de-4d96-88c2-9a171434c078"
             echo ""
@@ -495,19 +563,15 @@ jobs:
           echo "Tables expected  : $TABLE_COUNT"
           echo ""
 
-          # ── Early exit: no tables to enforce ──────────────────────────────
+          # ── Warning if CI discovered 0 tables (but DO NOT exit early) ─────
           if [ "$TABLE_COUNT" = "0" ]; then
-            echo "ℹ️  Schema discovery found 0 tables in the source workspace."
-            echo "   This means the Dev lakehouse either has no Delta tables, or"
-            echo "   the service principal cannot read the Delta transaction logs"
-            echo "   via the OneLake DFS API."
+            echo "⚠️  Schema discovery found 0 tables from CI (DFS API)."
+            echo "   This is expected for schema-enabled lakehouses where the"
+            echo "   service principal may not be able to read Delta logs from CI."
             echo ""
-            echo "   To fix: ensure the service principal has Storage Blob Data"
-            echo "   Reader access on the OneLake endpoint and that the lakehouse"
-            echo "   contains Delta tables under Tables/ (or Tables/dbo/)."
+            echo "   The notebook has runtime discovery using mssparkutils that"
+            echo "   works INSIDE the Fabric Spark environment. Proceeding..."
             echo ""
-            echo "✅  Enforce-schemas complete (0 tables — notebook execution skipped)"
-            exit 0
           fi
 
           # Discover UAT lakehouse ID dynamically
