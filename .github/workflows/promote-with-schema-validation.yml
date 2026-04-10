@@ -1,4 +1,4 @@
-﻿name: "🚀 Promote with Schema Validation"
+name: "🚀 Promote with Schema Validation"
 
 on:
   # ── Auto-trigger: fires when schema files change on main ──────────────────
@@ -283,8 +283,8 @@ jobs:
           retention-days: 1
 
   # ───────────────────────────────────────────────────────────
-  # JOB 2 — Approval gate + deployment
-  # Pauses here until a reviewer approves in the GitHub UI
+  # JOB 2 — Deploy
+  # Runs automatically after preflight
   # ───────────────────────────────────────────────────────────
   deploy:
     name: "🚢 Deploy via Fabric Pipeline"
