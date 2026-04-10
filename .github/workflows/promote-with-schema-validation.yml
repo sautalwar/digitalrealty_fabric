@@ -148,41 +148,92 @@ jobs:
             fi
           fi
 
+      - name: "🔬 Discover Live Schemas from Source Workspace"
+        id: discover
+        run: |
+          WS_ID="${{ steps.resolve_ws.outputs.source_workspace_id }}"
+          if [ -z "${{ secrets.FABRIC_TENANT_ID }}" ] || [ "$WS_ID" = "DEMO" ] || [ -z "$WS_ID" ]; then
+            echo "⚠️  No credentials or workspace ID — schema discovery skipped"
+            echo "discovered=false" >> $GITHUB_OUTPUT
+          else
+            FABRIC_TOKEN=$(curl -s -X POST \
+              "https://login.microsoftonline.com/${{ secrets.FABRIC_TENANT_ID }}/oauth2/v2.0/token" \
+              -d "client_id=${{ secrets.FABRIC_CLIENT_ID }}" \
+              -d "client_secret=${{ secrets.FABRIC_CLIENT_SECRET }}" \
+              -d "scope=https://api.fabric.microsoft.com/.default" \
+              -d "grant_type=client_credentials" | jq -r '.access_token')
+
+            STORAGE_TOKEN=$(curl -s -X POST \
+              "https://login.microsoftonline.com/${{ secrets.FABRIC_TENANT_ID }}/oauth2/v2.0/token" \
+              -d "client_id=${{ secrets.FABRIC_CLIENT_ID }}" \
+              -d "client_secret=${{ secrets.FABRIC_CLIENT_SECRET }}" \
+              -d "scope=https://storage.azure.com/.default" \
+              -d "grant_type=client_credentials" | jq -r '.access_token')
+
+            FABRIC_TOKEN="$FABRIC_TOKEN" \
+            STORAGE_TOKEN="$STORAGE_TOKEN" \
+            WORKSPACE_ID="$WS_ID" \
+            OUT_FILE="schema_discovery.json" \
+            python3 scripts/discover_fabric_schema.py
+
+            if [ -f schema_discovery.json ]; then
+              echo "discovered=true" >> $GITHUB_OUTPUT
+              python3 -c "import json,sys; d=json.load(open('schema_discovery.json')); print(f'✅ Discovered {d[\"table_count\"]} tables from {d[\"lakehouse_name\"]}')"
+            else
+              echo "⚠️  Schema discovery failed — falling back to static registry"
+              echo "discovered=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
       - name: "📋 Read Schema Registry"
         id: schema
         run: |
-          VERSION=$(python3 -c "
+          if [ -f schema_discovery.json ]; then
+            TABLE_COUNT=$(python3 -c "import json; d=json.load(open('schema_discovery.json')); print(d['table_count'])")
+            VERSION="live-$(date +%Y%m%d)"
+          else
+            VERSION=$(python3 -c "
           import re
           content = open('notebooks/00_schema_registry.py').read()
           m = re.search(r'SCHEMA_VERSION\s*=\s*[\"\']([\d.]+)', content)
           print(m.group(1) if m else 'unknown')
-          ")
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-          TABLE_COUNT=$(python3 -c "
+            ")
+            TABLE_COUNT=$(python3 -c "
           exec(open('notebooks/00_schema_registry.py').read())
           print(len(SCHEMAS))
-          ")
+            ")
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "table_count=$TABLE_COUNT" >> $GITHUB_OUTPUT
-
           echo "Schema Version : $VERSION"
-          echo "Tables defined : $TABLE_COUNT"
+          echo "Tables found   : $TABLE_COUNT"
 
-      - name: "✅ Validate Schema Registry Syntax"
+      - name: "✅ Validate Schema"
         run: |
-          python3 -c "
+          if [ -f schema_discovery.json ]; then
+            python3 -c "
+          import json
+          d = json.load(open('schema_discovery.json'))
+          print(f'Workspace  : {d[\"workspace_id\"]}')
+          print(f'Lakehouse  : {d[\"lakehouse_name\"]} ({d[\"lakehouse_id\"]})')
+          print(f'Tables     : {d[\"table_count\"]}')
+          print()
+          for t, s in d['tables'].items():
+              print(f'  {t}: {len(s[\"columns\"])} columns')
+          print()
+          print('Schema discovery: OK')
+            "
+          else
+            python3 -c "
           exec(open('notebooks/00_schema_registry.py').read())
           print(f'Schema version  : {SCHEMA_VERSION}')
-          print(f'Tables defined  : {len(SCHEMAS)}')
           total_cols = sum(len(s[\"columns\"]) for s in SCHEMAS.values())
-          print(f'Total columns   : {total_cols}')
-          print()
+          print(f'Tables: {len(SCHEMAS)},  Columns total: {total_cols}')
           for t, s in SCHEMAS.items():
-              layer = 'BRONZE' if t.startswith('bronze') else 'SILVER'
-              print(f'  [{layer}] {t}: {len(s[\"columns\"])} columns')
-          print()
+              print(f'  {t}: {len(s[\"columns\"])} columns')
           print('Schema registry syntax: OK')
-          "
+            "
+          fi
 
       - name: "📊 Write Pre-flight Summary"
         run: |
@@ -221,6 +272,14 @@ jobs:
               echo "> ✅ Pre-flight passed. Awaiting approval to deploy."
             fi
           } >> $GITHUB_STEP_SUMMARY
+
+      - name: "📤 Upload Schema Discovery Artifact"
+        if: steps.discover.outputs.discovered == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema-discovery
+          path: schema_discovery.json
+          retention-days: 1
 
   # ───────────────────────────────────────────────────────────
   # JOB 2 — Approval gate + deployment
@@ -356,6 +415,13 @@ jobs:
             fi
           fi
 
+      - name: "📥 Download Schema Discovery Artifact"
+        id: artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: schema-discovery
+        continue-on-error: true
+
       - name: "🗄️ Upload & Run Schema Enforcement Notebook"
         run: |
           TARGET="${{ env.TARGET_STAGE }}"
@@ -369,14 +435,37 @@ jobs:
           echo "Tables expected  : ${{ needs.preflight.outputs.table_count }}"
           echo ""
 
-          echo "Tables to enforce:"
-          python3 -c "
-          exec(open('notebooks/00_schema_registry.py').read())
-          for t, s in SCHEMAS.items():
-              print(f'  CREATE TABLE IF NOT EXISTS {t}  ({len(s[\"columns\"])} columns)')
-          "
+          # Discover UAT lakehouse ID dynamically
+          UAT_LH_ID=""
+          if [ -n "$TOKEN" ] && [ "$TOKEN" != "DEMO_TOKEN" ] && [ -n "$WS_ID" ]; then
+            UAT_LH_ID=$(curl -s \
+              -H "Authorization: Bearer $TOKEN" \
+              "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Lakehouse" \
+              | jq -r '.value[] | select(.displayName == "DataCenterLakehouse") | .id // empty' | head -1)
+            echo "UAT Lakehouse ID : $UAT_LH_ID"
+          fi
 
-          # Generate self-contained notebook payload from schema registry
+          # Show tables to enforce
+          echo "Tables to enforce:"
+          if [ -f schema_discovery.json ]; then
+            python3 -c "
+import json
+data = json.load(open('schema_discovery.json'))
+for t, s in data.get('tables', {}).items():
+    print(f'  CREATE TABLE IF NOT EXISTS {t}  ({len(s[\"columns\"])} columns)')
+"
+          else
+            echo "  (schema_discovery.json not found — will use static registry fallback)"
+          fi
+
+          # Generate self-contained notebook payload
+          SCHEMA_FILE_ARG=""
+          if [ -f schema_discovery.json ]; then
+            SCHEMA_FILE_ARG="schema_discovery.json"
+          fi
+          SCHEMA_FILE="$SCHEMA_FILE_ARG" \
+          LAKEHOUSE_ID="$UAT_LH_ID" \
+          WORKSPACE_ID="$WS_ID" \
           python3 scripts/gen_nb_payload.py
 
           if [ "$DRY_RUN" = "true" ] || [ "$DEMO_MODE" = "true" ] || [ -z "$WS_ID" ] || [[ "$WS_ID" == "<"* ]]; then
@@ -386,7 +475,7 @@ jobs:
             echo "   Creates all ${{ needs.preflight.outputs.table_count }} tables via CREATE TABLE IF NOT EXISTS"
             echo ""
             echo "✅  Dry run complete"
-            rm -f /tmp/nb_payload.json /tmp/gen_nb.py
+            rm -f /tmp/nb_payload.json
           else
             # Upload notebook — create new, fall back to existing on 409
             CREATE_RESP=$(curl -s -w "\n%{http_code}" -X POST \
@@ -398,28 +487,46 @@ jobs:
             HTTP_CODE=$(echo "$CREATE_RESP" | tail -1)
             BODY=$(echo "$CREATE_RESP" | head -n -1)
 
+            NOTEBOOK_ID=""
             if [ "$HTTP_CODE" = "201" ]; then
               NOTEBOOK_ID=$(echo "$BODY" | jq -r '.id')
               echo "✅ Notebook uploaded: $NOTEBOOK_ID"
             elif [ "$HTTP_CODE" = "202" ]; then
-              sleep 5
-              ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
-                "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Notebook")
-              NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_apply_schema") | .id')
-              echo "✅ Notebook created (async): $NOTEBOOK_ID"
+              echo "⏳ Notebook creation is async — polling up to 60s..."
+              for i in 1 2 3 4 5 6; do
+                sleep 10
+                ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
+                  "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Notebook")
+                NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_apply_schema") | .id // empty')
+                if [ -n "$NOTEBOOK_ID" ]; then
+                  echo "✅ Notebook ready (attempt $i): $NOTEBOOK_ID"
+                  break
+                fi
+                echo "   Attempt $i — not ready yet..."
+              done
             elif [ "$HTTP_CODE" = "409" ]; then
+              # Already exists — get its ID and update definition
               ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
                 "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Notebook")
-              NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_apply_schema") | .id')
-              echo "📎 Using existing notebook: $NOTEBOOK_ID"
+              NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_apply_schema") | .id // empty')
+              if [ -n "$NOTEBOOK_ID" ]; then
+                echo "📎 Notebook exists ($NOTEBOOK_ID) — updating definition..."
+                NB_DEF=$(jq '{definition: .definition}' /tmp/nb_payload.json)
+                curl -s -X POST \
+                  -H "Authorization: Bearer $TOKEN" \
+                  -H "Content-Type: application/json" \
+                  "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items/$NOTEBOOK_ID/updateDefinition" \
+                  -d "$NB_DEF"
+                echo "✅ Notebook definition updated: $NOTEBOOK_ID"
+              fi
             else
               echo "⚠️  Upload returned HTTP $HTTP_CODE — trying to find existing notebook"
               ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
                 "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Notebook")
-              NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_apply_schema") | .id')
+              NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_apply_schema") | .id // empty')
             fi
 
-            rm -f /tmp/nb_payload.json /tmp/gen_nb.py
+            rm -f /tmp/nb_payload.json
 
             if [ -z "$NOTEBOOK_ID" ]; then
               echo "❌ Could not find or create 00_apply_schema notebook in $TARGET"
@@ -486,11 +593,12 @@ jobs:
             echo "▶  DRY RUN — would trigger notebook: 03_data_quality_checks"
             echo "   Checks: row counts, null rates, duplicates, range validation"
             echo ""
-            echo "✅  Dry run complete — quality gate would enforce:"
-            echo "    - bronze_datacenters    : min 10 rows, 0 nulls on datacenter_id"
-            echo "    - silver_datacenters    : pue between 1.0–3.0"
-            echo "    - bronze_power_capacity : utilization_pct between 0–100"
-            echo "    - silver_customer_deployments : 0 duplicate deployment_id"
+            TABLE_COUNT="${{ needs.preflight.outputs.table_count }}"
+            echo "✅  Dry run complete — quality gate would validate $TABLE_COUNT tables"
+            echo "    - Row count minimum checks"
+            echo "    - Null rate enforcement on key columns"
+            echo "    - Duplicate detection on primary keys"
+            echo "    - Range validation on numeric fields"
           else
             ITEMS=$(curl -s \
               -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
