@@ -81,8 +81,72 @@ jobs:
       schema_version: ${{ steps.schema.outputs.version }}
       table_count: ${{ steps.schema.outputs.table_count }}
       dry_run: ${{ env.DRY_RUN_FLAG }}
+      source_workspace_id: ${{ steps.resolve_ws.outputs.source_workspace_id }}
+      target_workspace_id: ${{ steps.resolve_ws.outputs.target_workspace_id }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: "🔍 Resolve Workspace IDs from Fabric API"
+        id: resolve_ws
+        run: |
+          # Map stage names to Fabric workspace display names
+          case "${{ env.SOURCE_STAGE }}" in
+            "Development") SOURCE_NAME="DigitalRealty-Dev" ;;
+            "UAT")         SOURCE_NAME="DigitalRealty-UAT" ;;
+            *)             SOURCE_NAME="DigitalRealty-Dev" ;;
+          esac
+          case "${{ env.TARGET_STAGE }}" in
+            "UAT")        TARGET_NAME="DigitalRealty-UAT" ;;
+            "Production") TARGET_NAME="DigitalRealty-Prod" ;;
+            *)            TARGET_NAME="DigitalRealty-UAT" ;;
+          esac
+
+          echo "Looking up: $SOURCE_NAME  →  $TARGET_NAME"
+
+          if [ -z "${{ secrets.FABRIC_TENANT_ID }}" ]; then
+            echo "⚠️  No credentials — workspace ID lookup skipped"
+            echo "source_workspace_id=DEMO" >> $GITHUB_OUTPUT
+            echo "target_workspace_id=DEMO" >> $GITHUB_OUTPUT
+          else
+            TOKEN=$(curl -s -X POST \
+              "https://login.microsoftonline.com/${{ secrets.FABRIC_TENANT_ID }}/oauth2/v2.0/token" \
+              -d "client_id=${{ secrets.FABRIC_CLIENT_ID }}" \
+              -d "client_secret=${{ secrets.FABRIC_CLIENT_SECRET }}" \
+              -d "scope=https://api.fabric.microsoft.com/.default" \
+              -d "grant_type=client_credentials" | jq -r '.access_token')
+
+            if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+              echo "⚠️  Token acquisition failed — workspace IDs cannot be resolved"
+              echo "source_workspace_id=DEMO" >> $GITHUB_OUTPUT
+              echo "target_workspace_id=DEMO" >> $GITHUB_OUTPUT
+            else
+              WORKSPACES=$(curl -s -H "Authorization: Bearer $TOKEN" \
+                "https://api.fabric.microsoft.com/v1/workspaces")
+
+              SOURCE_ID=$(echo "$WORKSPACES" | jq -r --arg n "$SOURCE_NAME" \
+                '.value[] | select(.displayName == $n) | .id')
+              TARGET_ID=$(echo "$WORKSPACES" | jq -r --arg n "$TARGET_NAME" \
+                '.value[] | select(.displayName == $n) | .id')
+
+              if [ -z "$SOURCE_ID" ] || [ "$SOURCE_ID" = "null" ]; then
+                echo "❌ Workspace not found: $SOURCE_NAME"
+                echo "Available workspaces:"
+                echo "$WORKSPACES" | jq -r '.value[] | "  \(.displayName) (\(.id))"'
+                exit 1
+              fi
+              if [ -z "$TARGET_ID" ] || [ "$TARGET_ID" = "null" ]; then
+                echo "❌ Workspace not found: $TARGET_NAME"
+                echo "Available workspaces:"
+                echo "$WORKSPACES" | jq -r '.value[] | "  \(.displayName) (\(.id))"'
+                exit 1
+              fi
+
+              echo "✅ $SOURCE_NAME  =  $SOURCE_ID"
+              echo "✅ $TARGET_NAME  =  $TARGET_ID"
+              echo "source_workspace_id=$SOURCE_ID" >> $GITHUB_OUTPUT
+              echo "target_workspace_id=$TARGET_ID" >> $GITHUB_OUTPUT
+            fi
+          fi
 
       - name: "📋 Read Schema Registry"
         id: schema
@@ -198,8 +262,8 @@ jobs:
         run: |
           SOURCE="${{ env.SOURCE_STAGE }}"
           TARGET="${{ env.TARGET_STAGE }}"
-          DEV_WS="${{ vars.DEV_WORKSPACE_ID }}"
-          UAT_WS="${{ vars.UAT_WORKSPACE_ID }}"
+          SRC_WS="${{ needs.preflight.outputs.source_workspace_id }}"
+          TGT_WS="${{ needs.preflight.outputs.target_workspace_id }}"
           TOKEN="${{ steps.token.outputs.token }}"
           DEMO_MODE="${{ steps.token.outputs.demo_mode }}"
           SCHEMA_VERSION="${{ needs.preflight.outputs.schema_version }}"
@@ -210,32 +274,32 @@ jobs:
           echo "  Schema v$SCHEMA_VERSION"
           echo "============================================"
           echo ""
-          echo "  Dev workspace ID : $DEV_WS"
-          echo "  UAT workspace ID : $UAT_WS"
+          echo "  Source workspace : $SOURCE  ($SRC_WS)"
+          echo "  Target workspace : $TARGET  ($TGT_WS)"
           echo ""
 
-          if [ "$DEMO_MODE" = "true" ] || [ -z "$TOKEN" ] || [ "$TOKEN" = "DEMO_TOKEN" ]; then
-            echo "⚠️  Token unavailable — skipping live API checks"
+          if [ "$DEMO_MODE" = "true" ] || [ -z "$TOKEN" ] || [ "$TOKEN" = "DEMO_TOKEN" ] || [ "$SRC_WS" = "DEMO" ]; then
+            echo "⚠️  Token or workspace IDs unavailable — skipping live API checks"
             echo "   Schema enforcement will still run in Job 3"
           else
-            echo "🔍 Dev workspace items (source of truth):"
-            DEV_ITEMS=$(curl -s \
+            echo "🔍 Source workspace items ($SOURCE):"
+            SRC_ITEMS=$(curl -s \
               -H "Authorization: Bearer $TOKEN" \
-              "https://api.fabric.microsoft.com/v1/workspaces/$DEV_WS/items")
-            echo "$DEV_ITEMS" | jq -r '.value[] | "  [\(.type)] \(.displayName)"' 2>/dev/null \
+              "https://api.fabric.microsoft.com/v1/workspaces/$SRC_WS/items")
+            echo "$SRC_ITEMS" | jq -r '.value[] | "  [\(.type)] \(.displayName)"' 2>/dev/null \
               || echo "  (no items or could not parse response)"
-            DEV_COUNT=$(echo "$DEV_ITEMS" | jq '.value | length' 2>/dev/null || echo "?")
-            echo "  Total: $DEV_COUNT items in Dev"
+            SRC_COUNT=$(echo "$SRC_ITEMS" | jq '.value | length' 2>/dev/null || echo "?")
+            echo "  Total: $SRC_COUNT items in $SOURCE"
 
             echo ""
-            echo "🔍 UAT workspace items (before promotion):"
-            UAT_ITEMS=$(curl -s \
+            echo "🔍 Target workspace items ($TARGET — before promotion):"
+            TGT_ITEMS=$(curl -s \
               -H "Authorization: Bearer $TOKEN" \
-              "https://api.fabric.microsoft.com/v1/workspaces/$UAT_WS/items")
-            echo "$UAT_ITEMS" | jq -r '.value[] | "  [\(.type)] \(.displayName)"' 2>/dev/null \
+              "https://api.fabric.microsoft.com/v1/workspaces/$TGT_WS/items")
+            echo "$TGT_ITEMS" | jq -r '.value[] | "  [\(.type)] \(.displayName)"' 2>/dev/null \
               || echo "  (no items — schemas have not been promoted yet)"
-            UAT_COUNT=$(echo "$UAT_ITEMS" | jq '.value | length' 2>/dev/null || echo "?")
-            echo "  Total: $UAT_COUNT items in UAT"
+            TGT_COUNT=$(echo "$TGT_ITEMS" | jq '.value | length' 2>/dev/null || echo "?")
+            echo "  Total: $TGT_COUNT items in $TARGET"
 
             echo ""
             echo "✅  Both workspaces verified — proceeding to schema enforcement (Job 3)"
@@ -298,11 +362,7 @@ jobs:
           DRY_RUN="${{ env.DRY_RUN_FLAG }}"
           DEMO_MODE="${{ steps.token.outputs.demo_mode }}"
           TOKEN="${{ steps.token.outputs.token }}"
-
-          case "$TARGET" in
-            "UAT")        WS_ID="${{ vars.UAT_WORKSPACE_ID }}" ;;
-            "Production") WS_ID="${{ vars.PROD_WORKSPACE_ID }}" ;;
-          esac
+          WS_ID="${{ needs.preflight.outputs.target_workspace_id }}"
 
           echo "Target workspace : $TARGET ($WS_ID)"
           echo "Schema version   : ${{ needs.preflight.outputs.schema_version }}"
@@ -420,11 +480,7 @@ jobs:
           TARGET="${{ env.TARGET_STAGE }}"
           DRY_RUN="${{ env.DRY_RUN_FLAG }}"
           DEMO_MODE="${{ steps.token.outputs.demo_mode }}"
-
-          case "$TARGET" in
-            "UAT")        WS_ID="${{ vars.UAT_WORKSPACE_ID }}" ;;
-            "Production") WS_ID="${{ vars.PROD_WORKSPACE_ID }}" ;;
-          esac
+          WS_ID="${{ needs.preflight.outputs.target_workspace_id }}"
 
           if [ "$DRY_RUN" = "true" ] || [ "$DEMO_MODE" = "true" ] || [ -z "$WS_ID" ] || [[ "$WS_ID" == "<"* ]]; then
             echo "▶  DRY RUN — would trigger notebook: 03_data_quality_checks"
