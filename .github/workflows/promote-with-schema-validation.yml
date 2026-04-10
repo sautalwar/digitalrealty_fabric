@@ -5,12 +5,11 @@ on:
   push:
     branches:
       - main
-      - copilot/troubleshoot-promote-with-schema-validation
     paths:
       - "notebooks/00_schema_registry.py"   # schema definitions changed
       - "notebooks/00_sync_to_uat.py"       # schema enforcer changed
       - "migrations/**"                      # new migration scripts added
-      - "scripts/**"                         # discovery/generation scripts
+      - "scripts/**"                         # discovery/generation scripts changed
       - ".github/workflows/promote-with-schema-validation.yml"
 
   # ── Manual trigger: use for on-demand promotion or demo ───────────────────
