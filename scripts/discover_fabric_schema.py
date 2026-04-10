@@ -134,18 +134,54 @@ def list_tables_via_dfs(ws_id, lh_id, directory="Tables"):
         return []
 
 
+def _is_delta_table_dir(ws_id, lh_id, directory):
+    """Check whether a directory looks like a Delta table (has _delta_log/)."""
+    content = onelake_read(ws_id, lh_id, f"{directory}/_delta_log/00000000000000000000.json")
+    return content is not None
+
+
+# Directories under Tables/ that are NOT schema names — skip during schema discovery
+_NON_SCHEMA_DIRS = {"Files", "_delta_log", "_schemas", "__checkpoint", "_temporary"}
+
+
 def list_schema_aware_tables(ws_id, lh_id):
     """Two-level DFS listing for schema-enabled lakehouses: Tables/{schema}/{table}.
 
     Returns (table_list, schema_name) where table_list is a list of {"name": ...}
     dicts and schema_name is the first schema found with tables.
+
+    Prioritises the 'dbo' schema (Fabric's default) and filters out well-known
+    non-schema directories such as 'Files'.
     """
     schema_dirs = list_tables_via_dfs(ws_id, lh_id)
-    for sd in schema_dirs:
-        sname = sd["name"]
+
+    # Filter out non-schema directories
+    schema_names = [
+        sd["name"] for sd in schema_dirs
+        if sd["name"] not in _NON_SCHEMA_DIRS and not sd["name"].startswith("_")
+    ]
+    print(f"  Schema candidates (after filtering): {schema_names}")
+
+    # Try 'dbo' first (Fabric default schema), then the rest
+    ordered = sorted(schema_names, key=lambda s: (0 if s == "dbo" else 1, s))
+
+    for sname in ordered:
         sub_tables = list_tables_via_dfs(ws_id, lh_id, f"Tables/{sname}")
         if sub_tables:
             return sub_tables, sname
+
+    # If schema-level listing yielded nothing, also try direct Tables/{name} in case
+    # the lakehouse has tables without a schema prefix despite being schema-enabled
+    for sd in schema_dirs:
+        sname = sd["name"]
+        if sname in _NON_SCHEMA_DIRS or sname.startswith("_"):
+            continue
+        if _is_delta_table_dir(ws_id, lh_id, f"Tables/{sname}"):
+            # This directory IS a table, not a schema
+            print(f"  ℹ️  Tables/{sname} looks like a Delta table, not a schema dir")
+            # Re-list Tables/ and treat each dir as a table directly
+            return schema_dirs, ""
+
     return [], "dbo"
 
 

@@ -31,6 +31,9 @@ if SCHEMA_FILE and os.path.isfile(SCHEMA_FILE):
     TABLES = list(disc.get("tables", {}).keys())
     SCHEMAS_ENABLED = disc.get("schemas_enabled", False)
     DEFAULT_SCHEMA = disc.get("default_schema", "dbo")
+    # Sanitise: "Files" is a storage area, not a valid schema name
+    if not DEFAULT_SCHEMA or DEFAULT_SCHEMA == "Files":
+        DEFAULT_SCHEMA = "dbo"
     if not SOURCE_LAKEHOUSE_ID:
         SOURCE_LAKEHOUSE_ID = disc.get("lakehouse_id", "")
     if not SOURCE_WORKSPACE_ID:
@@ -73,40 +76,72 @@ if has_source:
         "# Runtime discovery: list the actual table directory in Dev OneLake\n"
         "# This runs inside Fabric with native permissions — bypasses SP API limits\n"
         'dev_base_path = f"abfss://{DEV_WS_ID}@onelake.dfs.fabric.microsoft.com/{DEV_LH_ID}/Tables"\n'
-        "if SCHEMAS_ENABLED:\n"
-        '    dev_tables_path = f"{dev_base_path}/{DEFAULT_SCHEMA}"\n'
-        "else:\n"
-        "    dev_tables_path = dev_base_path\n\n"
-        "try:\n"
-        "    entries = mssparkutils.fs.ls(dev_tables_path)\n"
-        "    TABLES = [e.name.rstrip('/') for e in entries if e.isDir]\n"
-        '    print(f"Runtime discovery: {len(TABLES)} tables found in Dev OneLake")\n'
-        "    if not TABLES and not SCHEMAS_ENABLED:\n"
-        "        # Maybe it is actually schema-enabled — try with dbo/\n"
-        '        alt_path = f"{dev_base_path}/{DEFAULT_SCHEMA}"\n'
-        "        try:\n"
-        "            entries = mssparkutils.fs.ls(alt_path)\n"
-        "            TABLES = [e.name.rstrip('/') for e in entries if e.isDir]\n"
-        "            if TABLES:\n"
-        "                dev_tables_path = alt_path\n"
-        "                SCHEMAS_ENABLED = True\n"
-        '                print(f"  Detected schema-enabled: {len(TABLES)} tables in dbo/")\n'
-        "        except Exception:\n"
-        "            pass\n"
-        "except Exception as _e:\n"
-        '    print(f"Runtime discovery failed ({_e}), trying fallback...")\n'
+        "\n"
+        "# Directories that are never table names — skip during runtime discovery\n"
+        "_SKIP_DIRS = {'_delta_log', '_schemas', '_temporary', '__checkpoint', 'Files'}\n\n"
+        "def _try_list(path):\n"
+        "    '''List directories at path, filtering out non-table entries.'''\n"
         "    try:\n"
-        '        alt_path = f"{dev_base_path}/{DEFAULT_SCHEMA}" if not SCHEMAS_ENABLED else dev_base_path\n'
-        "        entries = mssparkutils.fs.ls(alt_path)\n"
-        "        TABLES = [e.name.rstrip('/') for e in entries if e.isDir]\n"
-        "        if TABLES:\n"
-        "            dev_tables_path = alt_path\n"
-        '            print(f"  Fallback discovery: {len(TABLES)} tables")\n'
-        "    except Exception as _e2:\n"
-        '        print(f"  Fallback also failed ({_e2}), using CI list")\n'
-        "        TABLES = CI_TABLES\n\n"
+        "        entries = mssparkutils.fs.ls(path)\n"
+        "        dirs = [e.name.rstrip('/') for e in entries if e.isDir]\n"
+        "        return [d for d in dirs if d not in _SKIP_DIRS and not d.startswith('_')]\n"
+        "    except Exception:\n"
+        "        return []\n\n"
+        "# Try multiple discovery strategies\n"
+        "TABLES = []\n"
+        "SCHEMAS_TO_TRY = ['dbo']\n"
+        "if DEFAULT_SCHEMA and DEFAULT_SCHEMA != 'dbo':\n"
+        "    SCHEMAS_TO_TRY.append(DEFAULT_SCHEMA)\n\n"
+        "# Strategy 1: try schema-prefixed paths (Tables/{schema}/)\n"
+        "for schema in SCHEMAS_TO_TRY:\n"
+        '    path = f"{dev_base_path}/{schema}"\n'
+        "    found = _try_list(path)\n"
+        "    if found:\n"
+        "        TABLES = found\n"
+        "        dev_tables_path = path\n"
+        "        SCHEMAS_ENABLED = True\n"
+        "        DEFAULT_SCHEMA = schema\n"
+        '        print(f"Runtime discovery: {len(TABLES)} tables in Tables/{schema}/")\n'
+        "        break\n\n"
+        "# Strategy 2: try direct Tables/ (non-schema-enabled)\n"
         "if not TABLES:\n"
-        '    print("WARNING: No tables found to sync. Check Dev OneLake permissions.")\n\n'
+        "    found = _try_list(dev_base_path)\n"
+        "    if found:\n"
+        "        TABLES = found\n"
+        "        dev_tables_path = dev_base_path\n"
+        "        SCHEMAS_ENABLED = False\n"
+        '        print(f"Runtime discovery: {len(TABLES)} tables in Tables/ (no schema)")\n\n'
+        "# Strategy 3: enumerate all schema folders dynamically\n"
+        "if not TABLES:\n"
+        "    try:\n"
+        "        schema_entries = mssparkutils.fs.ls(dev_base_path)\n"
+        "        schema_dirs = [e.name.rstrip('/') for e in schema_entries if e.isDir]\n"
+        "        for sd in schema_dirs:\n"
+        "            if sd in _SKIP_DIRS or sd.startswith('_'):\n"
+        "                continue\n"
+        '            path = f"{dev_base_path}/{sd}"\n'
+        "            found = _try_list(path)\n"
+        "            if found:\n"
+        "                TABLES = found\n"
+        "                dev_tables_path = path\n"
+        "                SCHEMAS_ENABLED = True\n"
+        "                DEFAULT_SCHEMA = sd\n"
+        '                print(f"Runtime discovery: {len(TABLES)} tables in Tables/{sd}/")\n'
+        "                break\n"
+        "    except Exception:\n"
+        "        pass\n\n"
+        "# Strategy 4: fall back to CI-discovered list\n"
+        "if not TABLES and CI_TABLES:\n"
+        "    TABLES = CI_TABLES\n"
+        "    if SCHEMAS_ENABLED:\n"
+        '        dev_tables_path = f"{dev_base_path}/{DEFAULT_SCHEMA}"\n'
+        "    else:\n"
+        "        dev_tables_path = dev_base_path\n"
+        '    print(f"Using CI table list: {len(TABLES)} tables")\n\n'
+        "if not TABLES:\n"
+        '    print("No tables found in Dev lakehouse — nothing to sync.")\n'
+        '    print("This is OK if the lakehouse is empty or tables have not been created yet.")\n'
+        "    mssparkutils.notebook.exit(value='No tables to sync — 0 tables in source')\n\n"
         "synced, failed = [], []\n"
         'print("=" * 60)\n'
         'print(f"Starting full data sync: {len(TABLES)} tables")\n'
