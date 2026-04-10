@@ -154,7 +154,7 @@ notebook = {
         {
             "cell_type": "code",
             "metadata": {},
-            "source": inner_code,
+            "source": inner_code.splitlines(keepends=True),
             "outputs": [],
             "execution_count": None,
         }
