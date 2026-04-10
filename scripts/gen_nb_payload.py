@@ -29,11 +29,15 @@ if SCHEMA_FILE and os.path.isfile(SCHEMA_FILE):
     disc = json.load(open(SCHEMA_FILE))
     SCHEMA_VERSION = f"live-{disc.get('workspace_id','')[:8]}"
     TABLES = list(disc.get("tables", {}).keys())
+    SCHEMAS_ENABLED = disc.get("schemas_enabled", False)
+    DEFAULT_SCHEMA = disc.get("default_schema", "dbo")
     if not SOURCE_LAKEHOUSE_ID:
         SOURCE_LAKEHOUSE_ID = disc.get("lakehouse_id", "")
     if not SOURCE_WORKSPACE_ID:
         SOURCE_WORKSPACE_ID = disc.get("workspace_id", "")
     print(f"Schema source   : {SCHEMA_FILE} ({len(TABLES)} tables)")
+    if SCHEMAS_ENABLED:
+        print(f"Schemas enabled : yes (default schema: {DEFAULT_SCHEMA})")
 else:
     repo_root = os.path.join(os.path.dirname(__file__), "..")
     registry_path = os.path.join(repo_root, "notebooks", "00_schema_registry.py")
@@ -41,6 +45,8 @@ else:
     exec(open(registry_path).read(), ns)
     SCHEMA_VERSION = ns["SCHEMA_VERSION"]
     TABLES = list(ns["SCHEMAS"].keys())
+    SCHEMAS_ENABLED = False
+    DEFAULT_SCHEMA = "dbo"
     print(f"Schema source   : 00_schema_registry.py (static fallback, {len(TABLES)} tables)")
 
 print(f"Source workspace: {SOURCE_WORKSPACE_ID}")
@@ -53,23 +59,52 @@ has_source = bool(SOURCE_WORKSPACE_ID and SOURCE_LAKEHOUSE_ID)
 
 if has_source:
     ci_tables_repr = repr(TABLES)  # may be [] if CI discovery returned 0 tables
+    schemas_enabled_repr = repr(SCHEMAS_ENABLED)
+    default_schema_repr = repr(DEFAULT_SCHEMA)
     inner_code = (
         "# Auto-generated — Digital Realty Full Data Sync\n"
         "# Reads from Dev OneLake -> writes to this workspace lakehouse\n"
         f"# Schema version: {SCHEMA_VERSION}\n\n"
         f'DEV_WS_ID = "{SOURCE_WORKSPACE_ID}"\n'
         f'DEV_LH_ID = "{SOURCE_LAKEHOUSE_ID}"\n'
-        f"CI_TABLES = {ci_tables_repr}  # from CI schema discovery (may be empty)\n\n"
-        "# Runtime discovery: list the actual Tables/ directory in Dev OneLake\n"
+        f"CI_TABLES = {ci_tables_repr}  # from CI schema discovery (may be empty)\n"
+        f"SCHEMAS_ENABLED = {schemas_enabled_repr}\n"
+        f"DEFAULT_SCHEMA = {default_schema_repr}\n\n"
+        "# Runtime discovery: list the actual table directory in Dev OneLake\n"
         "# This runs inside Fabric with native permissions — bypasses SP API limits\n"
-        f'dev_tables_path = f"abfss://{{DEV_WS_ID}}@onelake.dfs.fabric.microsoft.com/{{DEV_LH_ID}}/Tables"\n'
+        'dev_base_path = f"abfss://{DEV_WS_ID}@onelake.dfs.fabric.microsoft.com/{DEV_LH_ID}/Tables"\n'
+        "if SCHEMAS_ENABLED:\n"
+        '    dev_tables_path = f"{dev_base_path}/{DEFAULT_SCHEMA}"\n'
+        "else:\n"
+        "    dev_tables_path = dev_base_path\n\n"
         "try:\n"
         "    entries = mssparkutils.fs.ls(dev_tables_path)\n"
         "    TABLES = [e.name.rstrip('/') for e in entries if e.isDir]\n"
         '    print(f"Runtime discovery: {len(TABLES)} tables found in Dev OneLake")\n'
+        "    if not TABLES and not SCHEMAS_ENABLED:\n"
+        "        # Maybe it is actually schema-enabled — try with dbo/\n"
+        '        alt_path = f"{dev_base_path}/dbo"\n'
+        "        try:\n"
+        "            entries = mssparkutils.fs.ls(alt_path)\n"
+        "            TABLES = [e.name.rstrip('/') for e in entries if e.isDir]\n"
+        "            if TABLES:\n"
+        "                dev_tables_path = alt_path\n"
+        "                SCHEMAS_ENABLED = True\n"
+        '                print(f"  Detected schema-enabled: {len(TABLES)} tables in dbo/")\n'
+        "        except Exception:\n"
+        "            pass\n"
         "except Exception as _e:\n"
-        '    print(f"Runtime discovery failed ({_e}), using CI list ({len(CI_TABLES)} tables)")\n'
-        "    TABLES = CI_TABLES\n\n"
+        '    print(f"Runtime discovery failed ({_e}), trying fallback...")\n'
+        "    try:\n"
+        '        alt_path = f"{dev_base_path}/dbo" if not SCHEMAS_ENABLED else dev_base_path\n'
+        "        entries = mssparkutils.fs.ls(alt_path)\n"
+        "        TABLES = [e.name.rstrip('/') for e in entries if e.isDir]\n"
+        "        if TABLES:\n"
+        "            dev_tables_path = alt_path\n"
+        '            print(f"  Fallback discovery: {len(TABLES)} tables")\n'
+        "    except Exception as _e2:\n"
+        '        print(f"  Fallback also failed ({_e2}), using CI list")\n'
+        "        TABLES = CI_TABLES\n\n"
         "if not TABLES:\n"
         '    print("WARNING: No tables found to sync. Check Dev OneLake permissions.")\n\n'
         "synced, failed = [], []\n"

@@ -73,15 +73,37 @@ def fabric_get(path):
         return {}
 
 
-def list_tables_via_dfs(ws_id, lh_id):
-    """List table directories via OneLake DFS directory-listing API (ADLS Gen2)."""
+def fabric_get_detect_error(path):
+    """Like fabric_get but returns (data_dict, error_code_string_or_None)."""
+    url = f"https://api.fabric.microsoft.com/v1{path}"
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {FABRIC_TOKEN}"}
+    )
+    try:
+        with urllib.request.urlopen(req) as r:
+            return json.loads(r.read()), None
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:500]
+        print(f"  ⚠️  HTTP {e.code} for {path}: {body}")
+        try:
+            err = json.loads(body)
+            return {}, err.get("errorCode", f"HTTP_{e.code}")
+        except (json.JSONDecodeError, ValueError):
+            return {}, f"HTTP_{e.code}"
+    except Exception as e:
+        print(f"  ⚠️  Request failed for {path}: {e}")
+        return {}, str(e)
+
+
+def list_tables_via_dfs(ws_id, lh_id, directory="Tables"):
+    """List subdirectories via OneLake DFS List Paths API (ADLS Gen2)."""
     if not STORAGE_TOKEN:
         print("  ⚠️  STORAGE_TOKEN not set — DFS listing skipped")
         return []
     url = (
         f"https://onelake.dfs.fabric.microsoft.com"
-        f"/{ws_id}/{lh_id}/Tables"
-        f"?resource=directory&recursive=false"
+        f"/{ws_id}/{lh_id}"
+        f"?resource=filesystem&directory={directory}&recursive=false"
     )
     req = urllib.request.Request(
         url,
@@ -101,14 +123,14 @@ def list_tables_via_dfs(ws_id, lh_id):
                 name = p["name"].split("/")[-1]
                 if name:
                     tables.append({"name": name})
-        print(f"  DFS listing: {len(tables)} table folder(s) found")
+        print(f"  DFS listing ({directory}): {len(tables)} folder(s) found")
         return tables
     except urllib.error.HTTPError as e:
         body = e.read().decode()[:400]
-        print(f"  ⚠️  DFS listing HTTP {e.code}: {body}")
+        print(f"  ⚠️  DFS listing HTTP {e.code} ({directory}): {body}")
         return []
     except Exception as e:
-        print(f"  ⚠️  DFS listing failed: {e}")
+        print(f"  ⚠️  DFS listing failed ({directory}): {e}")
         return []
 
 
@@ -191,14 +213,34 @@ else:
 lh = None
 LH_ID = ""
 LH_NAME = ""
+schemas_enabled = False
+default_schema = "dbo"
+
 for candidate in candidates:
     cid = candidate["id"]
     cname = candidate["displayName"]
     print(f"  Trying lakehouse: {cname} ({cid})")
-    tables_check = fabric_get(f"/workspaces/{WORKSPACE_ID}/lakehouses/{cid}/tables")
-    tbl_list = tables_check.get("data", []) or tables_check.get("value", [])
-    if not tbl_list:
-        tbl_list = list_tables_via_dfs(WORKSPACE_ID, cid)
+    tbl_list = []
+    tables_check, err_code = fabric_get_detect_error(
+        f"/workspaces/{WORKSPACE_ID}/lakehouses/{cid}/tables"
+    )
+    if err_code == "UnsupportedOperationForSchemasEnabledLakehouse":
+        schemas_enabled = True
+        print(f"  ℹ️  Schema-enabled lakehouse — using DFS schema-aware listing")
+        # First level: list schema folders under Tables/
+        schema_dirs = list_tables_via_dfs(WORKSPACE_ID, cid)
+        for sd in schema_dirs:
+            sname = sd["name"]
+            # Second level: list table folders under Tables/{schema}/
+            sub_tables = list_tables_via_dfs(WORKSPACE_ID, cid, f"Tables/{sname}")
+            if sub_tables:
+                default_schema = sname
+                tbl_list = sub_tables
+                break
+    else:
+        tbl_list = tables_check.get("data", []) or tables_check.get("value", [])
+        if not tbl_list:
+            tbl_list = list_tables_via_dfs(WORKSPACE_ID, cid)
     if tbl_list:
         lh = candidate
         LH_ID = cid
@@ -217,27 +259,39 @@ if not lh:
 
 print(f"✅ Lakehouse: {LH_NAME} ({LH_ID})")
 
-# 2. List tables — try Lakehouse Tables API first, fall back to DFS listing
-tables_resp = fabric_get(f"/workspaces/{WORKSPACE_ID}/lakehouses/{LH_ID}/tables")
-# Debug: show raw keys so we can diagnose API shape issues
-if tables_resp:
-    print(f"   Lakehouse Tables API response keys: {list(tables_resp.keys())}")
-# Accept either "data" or "value" key (Fabric API can differ by version)
-tables = tables_resp.get("data", []) or tables_resp.get("value", [])
-print(f"📋 Lakehouse Tables API: {len(tables)} table(s)")
-
-if not tables:
-    print("ℹ️  Lakehouse Tables API returned 0 — trying OneLake DFS directory listing...")
-    tables = list_tables_via_dfs(WORKSPACE_ID, LH_ID)
+# 2. List tables — schema-enabled uses DFS, others try Lakehouse Tables API first
+if schemas_enabled:
+    print(f"📋 Schema-enabled lakehouse — listing via DFS (schema: {default_schema})")
+    tables = []
+    schema_dirs = list_tables_via_dfs(WORKSPACE_ID, LH_ID)
+    for sd in schema_dirs:
+        sname = sd["name"]
+        sub = list_tables_via_dfs(WORKSPACE_ID, LH_ID, f"Tables/{sname}")
+        if sub:
+            default_schema = sname
+            tables = sub
+            break
+    print(f"📋 DFS schema-aware listing: {len(tables)} table(s) (schema: {default_schema})")
+else:
+    tables_resp = fabric_get(f"/workspaces/{WORKSPACE_ID}/lakehouses/{LH_ID}/tables")
+    if tables_resp:
+        print(f"   Lakehouse Tables API response keys: {list(tables_resp.keys())}")
+    tables = tables_resp.get("data", []) or tables_resp.get("value", [])
+    print(f"📋 Lakehouse Tables API: {len(tables)} table(s)")
+    if not tables:
+        print("ℹ️  Lakehouse Tables API returned 0 — trying OneLake DFS directory listing...")
+        tables = list_tables_via_dfs(WORKSPACE_ID, LH_ID)
 
 if not tables:
     print("⚠️  No tables found via any method — nothing to promote")
     output = {
-        "workspace_id":   WORKSPACE_ID,
-        "lakehouse_id":   LH_ID,
-        "lakehouse_name": LH_NAME,
-        "table_count":    0,
-        "tables":         {},
+        "workspace_id":    WORKSPACE_ID,
+        "lakehouse_id":    LH_ID,
+        "lakehouse_name":  LH_NAME,
+        "schemas_enabled": schemas_enabled,
+        "default_schema":  default_schema if schemas_enabled else "",
+        "table_count":     0,
+        "tables":          {},
     }
     with open(OUT_FILE, "w") as f:
         json.dump(output, f, indent=2)
@@ -252,11 +306,11 @@ for t in tables:
     tname = t["name"]
 
     # The first transaction log always contains the metaData with the schema.
-    # OneLake DFS path: /Tables/{name}/_delta_log/00000000000000000000.json
-    content = onelake_read(
-        WORKSPACE_ID, LH_ID,
-        f"Tables/{tname}/_delta_log/00000000000000000000.json"
-    )
+    if schemas_enabled:
+        delta_path = f"Tables/{default_schema}/{tname}/_delta_log/00000000000000000000.json"
+    else:
+        delta_path = f"Tables/{tname}/_delta_log/00000000000000000000.json"
+    content = onelake_read(WORKSPACE_ID, LH_ID, delta_path)
 
     if content is None:
         print(f"  ⚠️  {tname}: cannot read Delta log — skipping")
@@ -292,11 +346,13 @@ if skipped:
 
 # 4. Write output
 output = {
-    "workspace_id":   WORKSPACE_ID,
-    "lakehouse_id":   LH_ID,
-    "lakehouse_name": LH_NAME,
-    "table_count":    len(discovered),
-    "tables":         discovered,
+    "workspace_id":    WORKSPACE_ID,
+    "lakehouse_id":    LH_ID,
+    "lakehouse_name":  LH_NAME,
+    "schemas_enabled": schemas_enabled,
+    "default_schema":  default_schema if schemas_enabled else "",
+    "table_count":     len(discovered),
+    "tables":          discovered,
 }
 
 with open(OUT_FILE, "w") as f:
