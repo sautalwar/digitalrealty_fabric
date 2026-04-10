@@ -615,6 +615,7 @@ jobs:
             RUN_RESP=$(curl -s -w "\n%{http_code}" -D /tmp/run_headers.txt -X POST \
               -H "Authorization: Bearer $TOKEN" \
               -H "Content-Type: application/json" \
+              -H "Content-Length: 0" \
               "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items/$NOTEBOOK_ID/jobs/instances?jobType=RunNotebook")
 
             RUN_HTTP=$(echo "$RUN_RESP" | tail -1)
@@ -716,6 +717,7 @@ jobs:
               curl -s -X POST \
                 -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
                 -H "Content-Type: application/json" \
+                -H "Content-Length: 0" \
                 "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items/$QA_ID/jobs/instances?jobType=RunNotebook"
               echo "✅  Quality checks notebook triggered in $TARGET"
             else
