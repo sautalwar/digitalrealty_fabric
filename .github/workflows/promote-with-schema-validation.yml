@@ -588,7 +588,7 @@ jobs:
             rm -f /tmp/nb_payload.json
           else
             # Upload notebook — create new, fall back to existing on 409
-            CREATE_RESP=$(curl -s -w "\n%{http_code}" -X POST \
+            CREATE_RESP=$(curl -s -D /tmp/nb_headers.txt -w "\n%{http_code}" -X POST \
               -H "Authorization: Bearer $TOKEN" \
               -H "Content-Type: application/json" \
               "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items" \
@@ -601,18 +601,43 @@ jobs:
             if [ "$HTTP_CODE" = "201" ]; then
               NOTEBOOK_ID=$(echo "$BODY" | jq -r '.id')
               echo "✅ Notebook uploaded: $NOTEBOOK_ID"
-            elif [ "$HTTP_CODE" = "202" ]; then
-              echo "⏳ Notebook creation is async — polling up to 60s..."
-              for i in 1 2 3 4 5 6; do
-                sleep 10
-                ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
-                  "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Notebook")
-                NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_sync_to_uat") | .id // empty')
-                if [ -n "$NOTEBOOK_ID" ]; then
-                  echo "✅ Notebook ready (attempt $i): $NOTEBOOK_ID"
-                  break
+              elif [ "$HTTP_CODE" = "202" ]; then
+                LOCATION=$(grep -i "^operation-location:" /tmp/nb_headers.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
+                if [ -z "$LOCATION" ]; then
+                  LOCATION=$(grep -i "^location:" /tmp/nb_headers.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
                 fi
-                echo "   Attempt $i — not ready yet..."
+                echo "⏳ Notebook creation async — polling up to 180s..."
+                echo "   Operation URL: $LOCATION"
+                for i in $(seq 1 18); do
+                  sleep 10
+                  if [ -n "$LOCATION" ]; then
+                    STATUS_RESP=$(curl -s -H "Authorization: Bearer $TOKEN" "$LOCATION")
+                    STATUS=$(echo "$STATUS_RESP" | jq -r '.status // .Status // empty')
+                    echo "   Attempt $i — op status: $STATUS"
+                    if [ "$STATUS" = "Succeeded" ]; then
+                      NOTEBOOK_ID=$(echo "$STATUS_RESP" | jq -r '.resourceLocation // empty' | sed 's/.*\///')
+                      if [ -z "$NOTEBOOK_ID" ]; then
+                        ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
+                          "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Notebook")
+                        NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_sync_to_uat") | .id // empty')
+                      fi
+                      echo "✅ Notebook ready: $NOTEBOOK_ID"
+                      break
+                    elif [ "$STATUS" = "Failed" ]; then
+                      echo "❌ Notebook creation FAILED: $(echo "$STATUS_RESP" | jq -r '.error.message // empty')"
+                      break
+                    fi
+                  else
+                    ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
+                      "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Notebook")
+                    NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_sync_to_uat") | .id // empty')
+                    if [ -n "$NOTEBOOK_ID" ]; then
+                      echo "✅ Notebook ready (fallback, attempt $i): $NOTEBOOK_ID"
+                      break
+                    fi
+                    echo "   Attempt $i — not ready yet..."
+                  fi
+                done
               done
             elif [ "$HTTP_CODE" = "409" ]; then
               # Already exists — get its ID and update definition

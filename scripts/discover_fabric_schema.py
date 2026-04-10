@@ -73,6 +73,45 @@ def fabric_get(path):
         return {}
 
 
+def list_tables_via_dfs(ws_id, lh_id):
+    """List table directories via OneLake DFS directory-listing API (ADLS Gen2)."""
+    if not STORAGE_TOKEN:
+        print("  ⚠️  STORAGE_TOKEN not set — DFS listing skipped")
+        return []
+    url = (
+        f"https://onelake.dfs.fabric.microsoft.com"
+        f"/{ws_id}/{lh_id}/Tables"
+        f"?resource=directory&recursive=false"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {STORAGE_TOKEN}",
+            "x-ms-version": "2023-01-03",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req) as r:
+            data = json.loads(r.read())
+        paths = data.get("paths", [])
+        tables = []
+        for p in paths:
+            if str(p.get("isDirectory", "false")).lower() == "true":
+                # name is "Tables/year_2017" or just "year_2017"
+                name = p["name"].split("/")[-1]
+                if name:
+                    tables.append({"name": name})
+        print(f"  DFS listing: {len(tables)} table folder(s) found")
+        return tables
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:400]
+        print(f"  ⚠️  DFS listing HTTP {e.code}: {body}")
+        return []
+    except Exception as e:
+        print(f"  ⚠️  DFS listing failed: {e}")
+        return []
+
+
 def onelake_read(ws_id, lh_id, relative_path):
     """Read a file from OneLake DFS API. Requires STORAGE_TOKEN scope."""
     if not STORAGE_TOKEN:
@@ -149,13 +188,21 @@ LH_ID   = lh["id"]
 LH_NAME = lh["displayName"]
 print(f"✅ Lakehouse: {LH_NAME} ({LH_ID})")
 
-# 2. List tables
+# 2. List tables — try Lakehouse Tables API first, fall back to DFS listing
 tables_resp = fabric_get(f"/workspaces/{WORKSPACE_ID}/lakehouses/{LH_ID}/tables")
-tables = tables_resp.get("data", [])
-print(f"📋 Tables found: {len(tables)}")
+# Debug: show raw keys so we can diagnose API shape issues
+if tables_resp:
+    print(f"   Lakehouse Tables API response keys: {list(tables_resp.keys())}")
+# Accept either "data" or "value" key (Fabric API can differ by version)
+tables = tables_resp.get("data", []) or tables_resp.get("value", [])
+print(f"📋 Lakehouse Tables API: {len(tables)} table(s)")
 
 if not tables:
-    print("⚠️  No tables found in lakehouse — nothing to promote")
+    print("ℹ️  Lakehouse Tables API returned 0 — trying OneLake DFS directory listing...")
+    tables = list_tables_via_dfs(WORKSPACE_ID, LH_ID)
+
+if not tables:
+    print("⚠️  No tables found via any method — nothing to promote")
     output = {
         "workspace_id":   WORKSPACE_ID,
         "lakehouse_id":   LH_ID,
