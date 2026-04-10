@@ -22,7 +22,7 @@
 
 # COMMAND ----------
 
-WORKSPACE_NAME = "DigitalRealty_Dev"
+WORKSPACE_NAME = "DigitalRealty-Dev"
 DATASET_NAME = "DigitalRealty_Capacity"
 MEMORY_BUDGET_MB = 500
 

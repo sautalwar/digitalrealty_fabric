@@ -2,7 +2,7 @@
   "environment": "dev",
   "workspace_name": "DigitalRealty-Dev",
   "workspace_id": "ffb373f3-c810-453a-b598-badb52dfd152",
-  "lakehouse_name": "DataCenterLakehouse",
+  "lakehouse_name": "DigitalRealty_Capacity",
   "warehouse_name": "DLR_Dev_Warehouse",
   "sql_endpoint": "<DEV_SQL_ENDPOINT>",
   "filter_region": "ALL",

@@ -22,7 +22,7 @@ from datetime import datetime
 from pyspark.sql import functions as F
 from pyspark.sql.types import StructType
 
-LAKEHOUSE_NAME = "DL_Lakehouse"
+LAKEHOUSE_NAME = "DigitalRealty_Capacity"
 
 TABLES = [
     "bronze_datacenters",

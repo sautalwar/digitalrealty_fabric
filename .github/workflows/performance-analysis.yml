@@ -1,0 +1,345 @@
+name: "Performance Analysis"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: "Environment to analyze"
+        required: true
+        type: choice
+        options:
+          - dev
+          - uat
+          - prod
+      notebooks:
+        description: "Which notebooks to run"
+        required: true
+        type: choice
+        options:
+          - all
+          - bpa-only
+          - memory-only
+          - compression-only
+      dataset_name:
+        description: "Semantic model name"
+        required: false
+        type: string
+        default: "DigitalRealty_Capacity"
+
+concurrency:
+  group: performance-analysis-${{ github.event.inputs.target_environment }}
+  cancel-in-progress: false
+
+jobs:
+  run-analysis:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.target_environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "🔑 Get Fabric Access Token"
+        id: token
+        run: |
+          TOKEN=$(curl -s -X POST \
+            "https://login.microsoftonline.com/${{ secrets.FABRIC_TENANT_ID }}/oauth2/v2.0/token" \
+            -d "client_id=${{ secrets.FABRIC_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.FABRIC_CLIENT_SECRET }}" \
+            -d "scope=https://api.fabric.microsoft.com/.default" \
+            -d "grant_type=client_credentials" | jq -r '.access_token')
+
+          if [ "$TOKEN" == "null" ] || [ -z "$TOKEN" ]; then
+            echo "::error::Failed to acquire Fabric token"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: "🔍 Resolve Workspace"
+        id: config
+        run: |
+          ENV=${{ github.event.inputs.target_environment }}
+          TOKEN=${{ steps.token.outputs.token }}
+
+          # Map environment to workspace display name
+          case "$ENV" in
+            "dev")  WS_NAME="DigitalRealty-Dev" ;;
+            "uat")  WS_NAME="DigitalRealty-UAT" ;;
+            "prod") WS_NAME="DigitalRealty-Prod" ;;
+          esac
+
+          # Resolve workspace ID dynamically from Fabric API
+          WORKSPACES=$(curl -s -H "Authorization: Bearer $TOKEN" \
+            "https://api.fabric.microsoft.com/v1/workspaces")
+
+          WS_ID=$(echo "$WORKSPACES" | jq -r --arg n "$WS_NAME" \
+            '.value[] | select(.displayName == $n) | .id')
+
+          if [ -z "$WS_ID" ] || [ "$WS_ID" = "null" ]; then
+            echo "::error::Workspace '$WS_NAME' not found"
+            echo "Available workspaces:"
+            echo "$WORKSPACES" | jq -r '.value[] | "  \(.displayName) (\(.id))"'
+            exit 1
+          fi
+
+          echo "workspace_id=$WS_ID" >> $GITHUB_OUTPUT
+          echo "workspace_name=$WS_NAME" >> $GITHUB_OUTPUT
+          echo "✅ Workspace: $WS_NAME ($WS_ID)"
+          echo "   Dataset:   ${{ github.event.inputs.dataset_name }}"
+
+      - name: "📋 Find Notebooks in Workspace"
+        id: notebooks
+        run: |
+          TOKEN=${{ steps.token.outputs.token }}
+          WS_ID=${{ steps.config.outputs.workspace_id }}
+
+          ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
+            "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Notebook")
+
+          BPA_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "04_bpa_analyzer") | .id // empty')
+          MEM_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "05_memory_analyzer") | .id // empty')
+          CMP_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "06_compression_analyzer") | .id // empty')
+
+          echo "bpa_id=$BPA_ID" >> $GITHUB_OUTPUT
+          echo "mem_id=$MEM_ID" >> $GITHUB_OUTPUT
+          echo "cmp_id=$CMP_ID" >> $GITHUB_OUTPUT
+
+          echo "Notebooks found:"
+          echo "  04_bpa_analyzer:         ${BPA_ID:-NOT FOUND}"
+          echo "  05_memory_analyzer:      ${MEM_ID:-NOT FOUND}"
+          echo "  06_compression_analyzer: ${CMP_ID:-NOT FOUND}"
+
+          # Fail fast if no notebooks found
+          if [ -z "$BPA_ID" ] && [ -z "$MEM_ID" ] && [ -z "$CMP_ID" ]; then
+            echo "::error::No performance notebooks found in workspace. Ensure notebooks are synced via Git integration."
+            echo "All notebooks in workspace:"
+            echo "$ITEMS" | jq -r '.value[] | "  \(.displayName) (\(.id))"'
+            exit 1
+          fi
+
+      - name: "📊 Run 04 - Best Practice Analyzer"
+        id: bpa
+        if: >-
+          github.event.inputs.notebooks == 'all' ||
+          github.event.inputs.notebooks == 'bpa-only'
+        run: |
+          TOKEN=${{ steps.token.outputs.token }}
+          WS_ID=${{ steps.config.outputs.workspace_id }}
+          NB_ID=${{ steps.notebooks.outputs.bpa_id }}
+          NB_NAME="04_bpa_analyzer"
+
+          if [ -z "$NB_ID" ]; then
+            echo "::warning::$NB_NAME not found in workspace — skipping"
+            echo "result=skipped" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Triggering $NB_NAME ($NB_ID)..."
+
+          # Trigger notebook — capture Location header for job polling
+          RESPONSE=$(curl -s -D /tmp/bpa_headers.txt -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "Content-Length: 0" \
+            "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items/$NB_ID/jobs/instances?jobType=RunNotebook")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          if [ "$HTTP_CODE" != "202" ] && [ "$HTTP_CODE" != "200" ]; then
+            BODY=$(echo "$RESPONSE" | head -n -1)
+            echo "::error::Failed to trigger $NB_NAME (HTTP $HTTP_CODE): $BODY"
+            echo "result=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "✅ Triggered (HTTP $HTTP_CODE)"
+
+          # Get job polling URL from Location header
+          JOB_URL=$(grep -i "^location:" /tmp/bpa_headers.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
+          echo "   Job URL: $JOB_URL"
+
+          # Poll for completion (max 15 minutes)
+          echo "Polling for completion..."
+          for i in $(seq 1 30); do
+            sleep 30
+            if [ -n "$JOB_URL" ]; then
+              STATUS_RESP=$(curl -s -H "Authorization: Bearer $TOKEN" "$JOB_URL")
+              STATUS=$(echo "$STATUS_RESP" | jq -r '.status // "Unknown"')
+            else
+              STATUS_RESP=$(curl -s -H "Authorization: Bearer $TOKEN" \
+                "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items/$NB_ID/jobs/instances" \
+                | jq -r '.value[0]')
+              STATUS=$(echo "$STATUS_RESP" | jq -r '.status // "Unknown"')
+            fi
+
+            echo "  [$i/30] Status: $STATUS"
+
+            if [ "$STATUS" = "Completed" ]; then
+              echo "✅ $NB_NAME completed successfully"
+              echo "result=passed" >> $GITHUB_OUTPUT
+              exit 0
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
+              echo "::error::$NB_NAME $STATUS"
+              echo "$STATUS_RESP" | jq -r '.failureReason // .message // empty' 2>/dev/null
+              echo "result=failed" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          done
+
+          echo "::warning::$NB_NAME did not complete within 15 minutes"
+          echo "result=timeout" >> $GITHUB_OUTPUT
+
+      - name: "📊 Run 05 - Memory Analyzer"
+        id: mem
+        if: >-
+          github.event.inputs.notebooks == 'all' ||
+          github.event.inputs.notebooks == 'memory-only'
+        run: |
+          TOKEN=${{ steps.token.outputs.token }}
+          WS_ID=${{ steps.config.outputs.workspace_id }}
+          NB_ID=${{ steps.notebooks.outputs.mem_id }}
+          NB_NAME="05_memory_analyzer"
+
+          if [ -z "$NB_ID" ]; then
+            echo "::warning::$NB_NAME not found in workspace — skipping"
+            echo "result=skipped" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Triggering $NB_NAME ($NB_ID)..."
+
+          RESPONSE=$(curl -s -D /tmp/mem_headers.txt -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "Content-Length: 0" \
+            "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items/$NB_ID/jobs/instances?jobType=RunNotebook")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          if [ "$HTTP_CODE" != "202" ] && [ "$HTTP_CODE" != "200" ]; then
+            BODY=$(echo "$RESPONSE" | head -n -1)
+            echo "::error::Failed to trigger $NB_NAME (HTTP $HTTP_CODE): $BODY"
+            echo "result=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "✅ Triggered (HTTP $HTTP_CODE)"
+
+          JOB_URL=$(grep -i "^location:" /tmp/mem_headers.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
+          echo "   Job URL: $JOB_URL"
+
+          echo "Polling for completion..."
+          for i in $(seq 1 30); do
+            sleep 30
+            if [ -n "$JOB_URL" ]; then
+              STATUS_RESP=$(curl -s -H "Authorization: Bearer $TOKEN" "$JOB_URL")
+              STATUS=$(echo "$STATUS_RESP" | jq -r '.status // "Unknown"')
+            else
+              STATUS_RESP=$(curl -s -H "Authorization: Bearer $TOKEN" \
+                "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items/$NB_ID/jobs/instances" \
+                | jq -r '.value[0]')
+              STATUS=$(echo "$STATUS_RESP" | jq -r '.status // "Unknown"')
+            fi
+
+            echo "  [$i/30] Status: $STATUS"
+
+            if [ "$STATUS" = "Completed" ]; then
+              echo "✅ $NB_NAME completed successfully"
+              echo "result=passed" >> $GITHUB_OUTPUT
+              exit 0
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
+              echo "::error::$NB_NAME $STATUS"
+              echo "$STATUS_RESP" | jq -r '.failureReason // .message // empty' 2>/dev/null
+              echo "result=failed" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          done
+
+          echo "::warning::$NB_NAME did not complete within 15 minutes"
+          echo "result=timeout" >> $GITHUB_OUTPUT
+
+      - name: "📊 Run 06 - Compression Analyzer"
+        id: cmp
+        if: >-
+          github.event.inputs.notebooks == 'all' ||
+          github.event.inputs.notebooks == 'compression-only'
+        run: |
+          TOKEN=${{ steps.token.outputs.token }}
+          WS_ID=${{ steps.config.outputs.workspace_id }}
+          NB_ID=${{ steps.notebooks.outputs.cmp_id }}
+          NB_NAME="06_compression_analyzer"
+
+          if [ -z "$NB_ID" ]; then
+            echo "::warning::$NB_NAME not found in workspace — skipping"
+            echo "result=skipped" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Triggering $NB_NAME ($NB_ID)..."
+
+          RESPONSE=$(curl -s -D /tmp/cmp_headers.txt -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "Content-Length: 0" \
+            "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items/$NB_ID/jobs/instances?jobType=RunNotebook")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          if [ "$HTTP_CODE" != "202" ] && [ "$HTTP_CODE" != "200" ]; then
+            BODY=$(echo "$RESPONSE" | head -n -1)
+            echo "::error::Failed to trigger $NB_NAME (HTTP $HTTP_CODE): $BODY"
+            echo "result=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "✅ Triggered (HTTP $HTTP_CODE)"
+
+          JOB_URL=$(grep -i "^location:" /tmp/cmp_headers.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
+          echo "   Job URL: $JOB_URL"
+
+          echo "Polling for completion..."
+          for i in $(seq 1 30); do
+            sleep 30
+            if [ -n "$JOB_URL" ]; then
+              STATUS_RESP=$(curl -s -H "Authorization: Bearer $TOKEN" "$JOB_URL")
+              STATUS=$(echo "$STATUS_RESP" | jq -r '.status // "Unknown"')
+            else
+              STATUS_RESP=$(curl -s -H "Authorization: Bearer $TOKEN" \
+                "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items/$NB_ID/jobs/instances" \
+                | jq -r '.value[0]')
+              STATUS=$(echo "$STATUS_RESP" | jq -r '.status // "Unknown"')
+            fi
+
+            echo "  [$i/30] Status: $STATUS"
+
+            if [ "$STATUS" = "Completed" ]; then
+              echo "✅ $NB_NAME completed successfully"
+              echo "result=passed" >> $GITHUB_OUTPUT
+              exit 0
+            elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ]; then
+              echo "::error::$NB_NAME $STATUS"
+              echo "$STATUS_RESP" | jq -r '.failureReason // .message // empty' 2>/dev/null
+              echo "result=failed" >> $GITHUB_OUTPUT
+              exit 1
+            fi
+          done
+
+          echo "::warning::$NB_NAME did not complete within 15 minutes"
+          echo "result=timeout" >> $GITHUB_OUTPUT
+
+      - name: "📊 Summary"
+        if: always()
+        run: |
+          {
+            echo "## 📊 Performance Analysis Summary"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---------|-------|"
+            echo "| **Environment** | \`${{ github.event.inputs.target_environment }}\` |"
+            echo "| **Workspace** | \`${{ steps.config.outputs.workspace_name }}\` (\`${{ steps.config.outputs.workspace_id }}\`) |"
+            echo "| **Dataset** | \`${{ github.event.inputs.dataset_name }}\` |"
+            echo "| **Notebooks** | \`${{ github.event.inputs.notebooks }}\` |"
+            echo ""
+            echo "| Notebook | ID | Result |"
+            echo "|----------|----|--------|"
+            echo "| 04_bpa_analyzer | \`${{ steps.notebooks.outputs.bpa_id || 'N/A' }}\` | ${{ steps.bpa.outputs.result || 'skipped' }} |"
+            echo "| 05_memory_analyzer | \`${{ steps.notebooks.outputs.mem_id || 'N/A' }}\` | ${{ steps.mem.outputs.result || 'skipped' }} |"
+            echo "| 06_compression_analyzer | \`${{ steps.notebooks.outputs.cmp_id || 'N/A' }}\` | ${{ steps.cmp.outputs.result || 'skipped' }} |"
+          } >> $GITHUB_STEP_SUMMARY

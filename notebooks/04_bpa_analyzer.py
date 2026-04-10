@@ -22,7 +22,7 @@ import json
 from datetime import datetime
 
 # Configuration
-WORKSPACE_NAME = "DigitalRealty_Dev"
+WORKSPACE_NAME = "DigitalRealty-Dev"
 DATASET_NAME = "DigitalRealty_Capacity"
 
 # BPA rule categories to focus on
