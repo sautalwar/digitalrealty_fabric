@@ -982,10 +982,18 @@ jobs:
         if: always()
         run: |
           SCHEMA_VERSION="${{ needs.preflight.outputs.schema_version }}"
-          TABLE_COUNT="${{ needs.preflight.outputs.table_count }}"
+          CI_TABLE_COUNT="${{ needs.preflight.outputs.table_count }}"
+          UAT_TABLE_COUNT="${{ needs.enforce-schemas.outputs.uat_table_count }}"
           SOURCE="${{ env.SOURCE_STAGE }}"
           TARGET="${{ env.TARGET_STAGE }}"
           DRY_RUN="${{ env.DRY_RUN_FLAG }}"
+
+          # Use actual UAT count from post-notebook verification (not CI discovery count)
+          if [ -n "$UAT_TABLE_COUNT" ] && [ "$UAT_TABLE_COUNT" != "0" ] && [ "$UAT_TABLE_COUNT" != "unknown" ]; then
+            TABLE_COUNT="$UAT_TABLE_COUNT"
+          else
+            TABLE_COUNT="$CI_TABLE_COUNT (CI discovery — check Fabric portal for actual count)"
+          fi
 
           {
             echo "# ✅ Promotion Complete"
@@ -994,7 +1002,7 @@ jobs:
             echo "|---|---|"
             echo "| **Promoted** | \`$SOURCE\` → \`$TARGET\` |"
             echo "| **Schema Version** | \`v$SCHEMA_VERSION\` |"
-            echo "| **Tables Enforced** | $TABLE_COUNT |"
+            echo "| **Tables Synced** | $TABLE_COUNT |"
             echo "| **Quality Checks** | Triggered in \`$TARGET\` |"
             echo "| **Dry Run** | $DRY_RUN |"
             echo "| **Triggered by** | @${{ github.actor }} |"
@@ -1002,8 +1010,8 @@ jobs:
             echo "## What happened"
             echo "1. ✅ Schema registry validated (\`notebooks/00_schema_registry.py\`)"
             echo "2. ✅ Fabric deployment pipeline triggered (\`$SOURCE\` → \`$TARGET\`)"
-            echo "3. ✅ Schema enforcement notebook run in \`$TARGET\` workspace"
+            echo "3. ✅ Data sync notebook executed in \`$TARGET\` — **$TABLE_COUNT tables** synced from Dev"
             echo "4. ✅ Data quality checks triggered in \`$TARGET\` workspace"
             echo ""
-            echo "> **Next step:** Open \`$TARGET\` workspace in Fabric to verify tables appear in the Lakehouse."
+            echo "> **Next step:** Open \`$TARGET\` workspace in Fabric → open **DigitalRealty_Capacity** lakehouse to see the synced tables."
           } >> $GITHUB_STEP_SUMMARY
