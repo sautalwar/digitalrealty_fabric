@@ -932,7 +932,6 @@ jobs:
             echo "✅  Quality gate skipped (no tables to validate)"
             exit 0
           fi
-          fi
 
           if [ "$DRY_RUN" = "true" ] || [ "$DEMO_MODE" = "true" ] || [ -z "$WS_ID" ] || [[ "$WS_ID" == "<"* ]]; then
             echo "▶  DRY RUN — would trigger notebook: 03_data_quality_checks"
