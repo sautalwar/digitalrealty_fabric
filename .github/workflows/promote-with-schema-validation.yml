@@ -361,7 +361,119 @@ jobs:
             echo "  Total: $TGT_COUNT items in $TARGET"
 
             echo ""
-            echo "✅  Both workspaces verified — proceeding to schema enforcement (Job 3)"
+            echo "✅  Both workspaces verified — proceeding to deployment"
+          fi
+
+      - name: "🚀 Deploy All Items via Fabric Deployment Pipeline"
+        run: |
+          DRY_RUN="${{ env.DRY_RUN_FLAG }}"
+          TOKEN="${{ steps.token.outputs.token }}"
+          DEMO_MODE="${{ steps.token.outputs.demo_mode }}"
+          SOURCE="${{ env.SOURCE_STAGE }}"
+          TARGET="${{ env.TARGET_STAGE }}"
+
+          if [ "$DRY_RUN" = "true" ] || [ "$DEMO_MODE" = "true" ] || [ -z "$TOKEN" ] || [ "$TOKEN" = "DEMO_TOKEN" ]; then
+            echo "▶  DRY RUN / DEMO — would deploy all items from $SOURCE → $TARGET"
+            echo "   Fabric deployment pipeline would copy all Lakehouses, Notebooks,"
+            echo "   Semantic Models, and other artifacts from $SOURCE to $TARGET."
+            echo "✅  Dry run complete"
+          else
+            # Resolve source stage order
+            case "$SOURCE" in
+              "Development") SRC_ORDER=0 ;;
+              "UAT")         SRC_ORDER=1 ;;
+              *)             SRC_ORDER=0 ;;
+            esac
+
+            # Find the deployment pipeline
+            PIPELINE_ID="${{ vars.DEPLOYMENT_PIPELINE_ID }}"
+            if [ -z "$PIPELINE_ID" ]; then
+              echo "🔍 DEPLOYMENT_PIPELINE_ID not set — looking up pipeline by name..."
+              PIPELINES=$(curl -s -H "Authorization: Bearer $TOKEN" \
+                "https://api.fabric.microsoft.com/v1/deploymentPipelines")
+              PIPELINE_ID=$(echo "$PIPELINES" | jq -r \
+                '.value[] | select(.displayName == "DigitalRealty-DevToUATToProd") | .id // empty' | head -1)
+              if [ -z "$PIPELINE_ID" ]; then
+                echo "❌ Could not find deployment pipeline 'DigitalRealty-DevToUATToProd'"
+                echo "Available pipelines:"
+                echo "$PIPELINES" | jq -r '.value[] | "  \(.displayName) (\(.id))"' 2>/dev/null
+                exit 1
+              fi
+              echo "✅ Found pipeline: $PIPELINE_ID"
+            fi
+
+            # Get pipeline stages to find source stage items
+            echo "📋 Listing items in $SOURCE stage (order=$SRC_ORDER)..."
+            STAGES=$(curl -s -H "Authorization: Bearer $TOKEN" \
+              "https://api.fabric.microsoft.com/v1/deploymentPipelines/$PIPELINE_ID/stages")
+            SOURCE_STAGE_ID=$(echo "$STAGES" | jq -r \
+              --argjson order "$SRC_ORDER" '.value[] | select(.order == $order) | .id // empty')
+
+            if [ -z "$SOURCE_STAGE_ID" ]; then
+              echo "❌ Could not find source stage with order=$SRC_ORDER"
+              echo "$STAGES" | jq -r '.value[] | "  Stage \(.order): \(.displayName) (\(.id))"' 2>/dev/null
+              exit 1
+            fi
+
+            # List all items in the source stage
+            STAGE_ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
+              "https://api.fabric.microsoft.com/v1/deploymentPipelines/$PIPELINE_ID/stages/$SOURCE_STAGE_ID/items")
+            ITEM_COUNT=$(echo "$STAGE_ITEMS" | jq '.value | length' 2>/dev/null || echo "0")
+            echo "   Found $ITEM_COUNT items to deploy"
+            echo "$STAGE_ITEMS" | jq -r '.value[] | "   [\(.itemType // .type)] \(.itemDisplayName // .displayName)"' 2>/dev/null
+
+            if [ "$ITEM_COUNT" = "0" ]; then
+              echo "⚠️  No items found in source stage — nothing to deploy"
+            else
+              # Build deploy payload with all items
+              DEPLOY_ITEMS=$(echo "$STAGE_ITEMS" | jq '[.value[] | {sourceObjectId: .itemId}]')
+              DEPLOY_BODY=$(jq -n \
+                --argjson order "$SRC_ORDER" \
+                --argjson items "$DEPLOY_ITEMS" \
+                '{sourceStageOrder: $order, items: $items, note: "Automated promotion by GitHub Actions — all items from Dev to UAT"}')
+
+              echo ""
+              echo "🚀 Deploying all $ITEM_COUNT items: $SOURCE → $TARGET..."
+              DEPLOY_RESP=$(curl -s -w "\n%{http_code}" -X POST \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Content-Type: application/json" \
+                "https://api.fabric.microsoft.com/v1/deploymentPipelines/$PIPELINE_ID/deploy" \
+                -d "$DEPLOY_BODY")
+
+              DEPLOY_HTTP=$(echo "$DEPLOY_RESP" | tail -1)
+              DEPLOY_BODY_RESP=$(echo "$DEPLOY_RESP" | head -n -1)
+
+              if [ "$DEPLOY_HTTP" = "200" ] || [ "$DEPLOY_HTTP" = "202" ]; then
+                echo "✅ Deployment pipeline triggered successfully (HTTP $DEPLOY_HTTP)"
+                echo "   All items from $SOURCE are being copied to $TARGET"
+
+                # If 202 (async), poll for completion
+                if [ "$DEPLOY_HTTP" = "202" ]; then
+                  OPERATION_URL=$(echo "$DEPLOY_BODY_RESP" | jq -r '.url // .operationUrl // empty')
+                  if [ -n "$OPERATION_URL" ]; then
+                    echo "⏳ Deployment is async — polling for completion..."
+                    for i in 1 2 3 4 5 6 7 8 9 10; do
+                      sleep 15
+                      STATUS_RESP=$(curl -s -H "Authorization: Bearer $TOKEN" "$OPERATION_URL")
+                      STATUS=$(echo "$STATUS_RESP" | jq -r '.status // "Unknown"')
+                      echo "   Attempt $i: status=$STATUS"
+                      if [ "$STATUS" = "Succeeded" ] || [ "$STATUS" = "Completed" ]; then
+                        echo "✅ Deployment completed successfully"
+                        break
+                      elif [ "$STATUS" = "Failed" ]; then
+                        echo "❌ Deployment failed"
+                        echo "$STATUS_RESP" | jq '.' 2>/dev/null
+                        exit 1
+                      fi
+                    done
+                  fi
+                fi
+              else
+                echo "❌ Deployment failed (HTTP $DEPLOY_HTTP)"
+                echo "$DEPLOY_BODY_RESP"
+                exit 1
+              fi
+            fi
           fi
 
       - name: "📝 Write Deploy Summary"
@@ -449,11 +561,11 @@ jobs:
           echo "Tables to enforce:"
           if [ -f schema_discovery.json ]; then
             python3 -c "
-import json
-data = json.load(open('schema_discovery.json'))
-for t, s in data.get('tables', {}).items():
-    print(f'  CREATE TABLE IF NOT EXISTS {t}  ({len(s[\"columns\"])} columns)')
-"
+          import json
+          data = json.load(open('schema_discovery.json'))
+          for t, s in data.get('tables', {}).items():
+              print(f'  CREATE TABLE IF NOT EXISTS {t}  ({len(s[\"columns\"])} columns)')
+          "
           else
             echo "  (schema_discovery.json not found — will use static registry fallback)"
           fi
