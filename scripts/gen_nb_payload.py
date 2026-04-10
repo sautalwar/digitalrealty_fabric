@@ -31,8 +31,8 @@ if SCHEMA_FILE and os.path.isfile(SCHEMA_FILE):
     TABLES = list(disc.get("tables", {}).keys())
     SCHEMAS_ENABLED = disc.get("schemas_enabled", False)
     DEFAULT_SCHEMA = disc.get("default_schema", "dbo")
-    # Sanitise: "Files" is a storage area, not a schema name
-    if DEFAULT_SCHEMA in ("Files", "", "dbo") or not DEFAULT_SCHEMA:
+    # Sanitise: "Files" is a storage area, not a valid schema name
+    if not DEFAULT_SCHEMA or DEFAULT_SCHEMA == "Files":
         DEFAULT_SCHEMA = "dbo"
     if not SOURCE_LAKEHOUSE_ID:
         SOURCE_LAKEHOUSE_ID = disc.get("lakehouse_id", "")
@@ -77,14 +77,14 @@ if has_source:
         "# This runs inside Fabric with native permissions — bypasses SP API limits\n"
         'dev_base_path = f"abfss://{DEV_WS_ID}@onelake.dfs.fabric.microsoft.com/{DEV_LH_ID}/Tables"\n'
         "\n"
+        "# Directories that are never table names — skip during runtime discovery\n"
+        "_SKIP_DIRS = {'_delta_log', '_schemas', '_temporary', '__checkpoint', 'Files'}\n\n"
         "def _try_list(path):\n"
         "    '''List directories at path, filtering out non-table entries.'''\n"
         "    try:\n"
         "        entries = mssparkutils.fs.ls(path)\n"
         "        dirs = [e.name.rstrip('/') for e in entries if e.isDir]\n"
-        "        # Filter out known non-table directories\n"
-        "        skip = {'_delta_log', '_schemas', '_temporary', '__checkpoint', 'Files'}\n"
-        "        return [d for d in dirs if d not in skip and not d.startswith('_')]\n"
+        "        return [d for d in dirs if d not in _SKIP_DIRS and not d.startswith('_')]\n"
         "    except Exception:\n"
         "        return []\n\n"
         "# Try multiple discovery strategies\n"
@@ -116,9 +116,8 @@ if has_source:
         "    try:\n"
         "        schema_entries = mssparkutils.fs.ls(dev_base_path)\n"
         "        schema_dirs = [e.name.rstrip('/') for e in schema_entries if e.isDir]\n"
-        "        skip = {'_delta_log', '_schemas', '_temporary', '__checkpoint', 'Files'}\n"
         "        for sd in schema_dirs:\n"
-        "            if sd in skip or sd.startswith('_'):\n"
+        "            if sd in _SKIP_DIRS or sd.startswith('_'):\n"
         "                continue\n"
         '            path = f"{dev_base_path}/{sd}"\n'
         "            found = _try_list(path)\n"
