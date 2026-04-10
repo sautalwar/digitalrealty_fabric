@@ -52,21 +52,34 @@ print(f"Target lakehouse: {LAKEHOUSE_ID}")
 has_source = bool(SOURCE_WORKSPACE_ID and SOURCE_LAKEHOUSE_ID)
 
 if has_source:
+    ci_tables_repr = repr(TABLES)  # may be [] if CI discovery returned 0 tables
     inner_code = (
         "# Auto-generated — Digital Realty Full Data Sync\n"
         "# Reads from Dev OneLake -> writes to this workspace lakehouse\n"
         f"# Schema version: {SCHEMA_VERSION}\n\n"
         f'DEV_WS_ID = "{SOURCE_WORKSPACE_ID}"\n'
         f'DEV_LH_ID = "{SOURCE_LAKEHOUSE_ID}"\n'
-        f"TABLES    = {repr(TABLES)}\n\n"
-        "synced, failed = [], []\n\n"
+        f"CI_TABLES = {ci_tables_repr}  # from CI schema discovery (may be empty)\n\n"
+        "# Runtime discovery: list the actual Tables/ directory in Dev OneLake\n"
+        "# This runs inside Fabric with native permissions — bypasses SP API limits\n"
+        f'dev_tables_path = f"abfss://{{DEV_WS_ID}}@onelake.dfs.fabric.microsoft.com/{{DEV_LH_ID}}/Tables"\n'
+        "try:\n"
+        "    entries = mssparkutils.fs.ls(dev_tables_path)\n"
+        "    TABLES = [e.name.rstrip('/') for e in entries if e.isDir]\n"
+        '    print(f"Runtime discovery: {len(TABLES)} tables found in Dev OneLake")\n'
+        "except Exception as _e:\n"
+        '    print(f"Runtime discovery failed ({_e}), using CI list ({len(CI_TABLES)} tables)")\n'
+        "    TABLES = CI_TABLES\n\n"
+        "if not TABLES:\n"
+        '    print("WARNING: No tables found to sync. Check Dev OneLake permissions.")\n\n'
+        "synced, failed = [], []\n"
         'print("=" * 60)\n'
         'print(f"Starting full data sync: {len(TABLES)} tables")\n'
-        'print(f"Source: abfss://{DEV_WS_ID}@onelake.dfs.fabric.microsoft.com/{DEV_LH_ID}/")\n'
+        'print(f"Source: {dev_tables_path}")\n'
         'print("=" * 60)\n\n'
         "for table in TABLES:\n"
         "    try:\n"
-        '        src = f"abfss://{DEV_WS_ID}@onelake.dfs.fabric.microsoft.com/{DEV_LH_ID}/Tables/{table}"\n'
+        '        src = f"{dev_tables_path}/{table}"\n'
         "        df = spark.read.format('delta').load(src)\n"
         "        row_count = df.count()\n"
         "        col_count = len(df.columns)\n"

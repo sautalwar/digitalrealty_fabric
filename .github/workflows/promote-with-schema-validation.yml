@@ -582,7 +582,6 @@ jobs:
                     echo "   Attempt $i — not ready yet..."
                   fi
                 done
-              done
             elif [ "$HTTP_CODE" = "409" ]; then
               # Already exists — get its ID and update definition
               ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
