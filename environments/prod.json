@@ -1,8 +1,8 @@
 {
   "environment": "prod",
-  "workspace_name": "DigitalRealty_Prod",
-  "workspace_id": "<PROD_WORKSPACE_ID>",
-  "lakehouse_name": "DLR_Prod_Lakehouse",
+  "workspace_name": "DigitalRealty-Prod",
+  "workspace_id": "4b305833-b5a5-4423-bb5e-9f824739918e",
+  "lakehouse_name": "DataCenterLakehouse",
   "warehouse_name": "DLR_Prod_Warehouse",
   "sql_endpoint": "<PROD_SQL_ENDPOINT>",
   "filter_region": "ALL",

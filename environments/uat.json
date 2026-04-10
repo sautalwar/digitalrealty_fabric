@@ -1,8 +1,8 @@
 {
   "environment": "uat",
-  "workspace_name": "DigitalRealty_UAT",
-  "workspace_id": "<UAT_WORKSPACE_ID>",
-  "lakehouse_name": "DLR_UAT_Lakehouse",
+  "workspace_name": "DigitalRealty-UAT",
+  "workspace_id": "a27b49db-255b-499e-a2ac-e00f8b812d1a",
+  "lakehouse_name": "DataCenterLakehouse",
   "warehouse_name": "DLR_UAT_Warehouse",
   "sql_endpoint": "<UAT_SQL_ENDPOINT>",
   "filter_region": "EMEA",
