@@ -83,6 +83,7 @@ DATASETS = {
 # COMMAND ----------
 
 for table_name, config in DATASETS.items():
+    target_table = f"bronze_{table_name}"
     print(f"Ingesting {table_name}...")
 
     df = (
@@ -99,17 +100,54 @@ for table_name, config in DATASETS.items():
         .withColumn("_source_file", lit(config["file"]))
     )
 
-    # Write as Delta table (overwrite for demo; use merge/append in production)
-    (
-        df.write
-        .format("delta")
-        .mode("overwrite")
-        .option("overwriteSchema", "true")
-        .saveAsTable(f"bronze_{table_name}")
-    )
+    # Check if table exists — incremental sync (new/changed rows only)
+    table_exists = False
+    try:
+        existing = spark.table(target_table)
+        table_exists = True
+    except Exception:
+        pass
 
-    row_count = spark.table(f"bronze_{table_name}").count()
-    print(f"   bronze_{table_name}: {row_count} rows loaded")
+    if not table_exists:
+        # First run — create table
+        (
+            df.write
+            .format("delta")
+            .mode("overwrite")
+            .saveAsTable(target_table)
+        )
+        row_count = spark.table(target_table).count()
+        print(f"   {target_table}: CREATED with {row_count} rows")
+    else:
+        # Incremental: add new columns if schema evolved
+        new_cols = set(df.columns) - set(existing.columns)
+        if new_cols:
+            for c in new_cols:
+                col_type = str(dict(df.dtypes).get(c, "string"))
+                spark.sql(f"ALTER TABLE {target_table} ADD COLUMN `{c}` {col_type}")
+            print(f"   {target_table}: added {len(new_cols)} new column(s): {new_cols}")
+            existing = spark.table(target_table)
+
+        # Only append rows not already in target (compare on all non-metadata cols)
+        compare_cols = sorted([c for c in df.columns if not c.startswith("_")])
+        src_subset = df.select(compare_cols)
+        tgt_subset = existing.select(compare_cols)
+        new_rows = src_subset.subtract(tgt_subset)
+        new_count = new_rows.count()
+
+        if new_count > 0:
+            # Get full rows (with metadata) for the new data
+            full_new = df.join(new_rows, on=compare_cols, how="inner").dropDuplicates()
+            (
+                full_new.write
+                .format("delta")
+                .mode("append")
+                .option("mergeSchema", "true")
+                .saveAsTable(target_table)
+            )
+            print(f"   {target_table}: appended {new_count} new rows")
+        else:
+            print(f"   {target_table}: no new rows (already in sync)")
 
 # COMMAND ----------
 

@@ -19,6 +19,61 @@ from pyspark.sql.functions import (
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Incremental Write Helper
+
+# COMMAND ----------
+
+def incremental_save(df, table_name, key_columns=None):
+    """Write only new/changed rows to a Delta table. Add new columns if schema evolved.
+    
+    If key_columns is provided, uses them for comparison.
+    Otherwise compares all non-metadata columns.
+    """
+    table_exists = False
+    try:
+        existing = spark.table(table_name)
+        table_exists = True
+    except Exception:
+        pass
+
+    if not table_exists:
+        df.write.format("delta").mode("overwrite").saveAsTable(table_name)
+        print(f"  {table_name}: CREATED with {df.count()} rows")
+        return
+
+    # Schema evolution: add new columns
+    new_cols = set(df.columns) - set(existing.columns)
+    if new_cols:
+        for c in new_cols:
+            col_type = str(dict(df.dtypes).get(c, "string"))
+            spark.sql(f"ALTER TABLE {table_name} ADD COLUMN `{c}` {col_type}")
+        print(f"  {table_name}: added {len(new_cols)} column(s): {new_cols}")
+        existing = spark.table(table_name)
+
+    # Determine comparison columns
+    if key_columns:
+        compare_cols = sorted(key_columns)
+    else:
+        compare_cols = sorted([c for c in df.columns if not c.startswith("_")])
+
+    common_cols = sorted(list(set(compare_cols) & set(existing.columns) & set(df.columns)))
+    src_subset = df.select(common_cols)
+    tgt_subset = existing.select(common_cols)
+    new_rows = src_subset.subtract(tgt_subset)
+    new_count = new_rows.count()
+
+    if new_count == 0:
+        print(f"  {table_name}: no changes ({existing.count()} rows, in sync)")
+        return
+
+    # Append only the changed/new rows
+    full_new = df.join(new_rows, on=common_cols, how="inner").dropDuplicates()
+    full_new.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(table_name)
+    print(f"  {table_name}: appended {new_count} new/changed rows (was {existing.count()})")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Silver: Datacenters with Efficiency Ratings
 
 # COMMAND ----------
@@ -40,7 +95,7 @@ silver_dc = (
     .drop("_ingested_at", "_source_file")
 )
 
-silver_dc.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("silver_datacenters")
+incremental_save(silver_dc, "silver_datacenters", key_columns=["datacenter_id"])
 print(f"silver_datacenters: {silver_dc.count()} rows")
 
 # COMMAND ----------
@@ -71,7 +126,7 @@ silver_cap = (
     .drop("_ingested_at", "_source_file")
 )
 
-silver_cap.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("silver_capacity_trends")
+incremental_save(silver_cap, "silver_capacity_trends", key_columns=["capacity_id"])
 print(f"silver_capacity_trends: {silver_cap.count()} rows")
 
 # COMMAND ----------
@@ -115,7 +170,7 @@ silver_dep = (
     .drop("_ingested_at", "_source_file")
 )
 
-silver_dep.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("silver_customer_deployments")
+incremental_save(silver_dep, "silver_customer_deployments", key_columns=["deployment_id"])
 print(f"silver_customer_deployments: {silver_dep.count()} rows")
 
 # COMMAND ----------
@@ -163,6 +218,6 @@ regional = (
     .orderBy("region")
 )
 
-regional.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("silver_regional_summary")
+incremental_save(regional, "silver_regional_summary", key_columns=["region"])
 print("silver_regional_summary:")
 regional.show(truncate=False)

@@ -2,8 +2,9 @@
 Generate a self-contained Fabric notebook payload (nb_payload.json).
 Called by the promote-with-schema-validation workflow.
 
-The generated notebook reads ALL data from Dev OneLake (abfss) and writes it
-to the target workspace default lakehouse — full schema + data sync.
+The generated notebook reads data from Dev OneLake (abfss) and writes
+incrementally to the target workspace — only new/changed rows and schema
+changes (new columns) are applied. Existing data is NOT overwritten.
 
 Env vars (all optional):
   SCHEMA_FILE          Path to schema_discovery.json
@@ -142,32 +143,104 @@ if has_source:
         '    print("No tables found in Dev lakehouse — nothing to sync.")\n'
         '    print("This is OK if the lakehouse is empty or tables have not been created yet.")\n'
         "    mssparkutils.notebook.exit(value='No tables to sync — 0 tables in source')\n\n"
-        "synced, failed = [], []\n"
+        "synced, failed, skipped_empty = [], [], []\n"
         'print("=" * 60)\n'
-        'print(f"Starting full data sync: {len(TABLES)} tables")\n'
+        'print(f"Starting incremental data sync: {len(TABLES)} tables")\n'
         'print(f"Source: {dev_tables_path}")\n'
+        'print("Strategy: schema diff + new/changed rows only")\n'
         'print("=" * 60)\n\n'
         "for table in TABLES:\n"
         "    try:\n"
         '        src = f"{dev_tables_path}/{table}"\n'
-        "        df = spark.read.format('delta').load(src)\n"
-        "        row_count = df.count()\n"
-        "        col_count = len(df.columns)\n"
-        "        (df.write\n"
-        "           .format('delta')\n"
-        "           .mode('overwrite')\n"
-        "           .option('overwriteSchema', 'true')\n"
-        "           .saveAsTable(table))\n"
-        '        print(f"OK  {table}: {row_count} rows, {col_count} columns")\n'
-        "        synced.append((table, row_count))\n"
+        "        src_df = spark.read.format('delta').load(src)\n"
+        "        src_count = src_df.count()\n"
+        "        src_cols = set(src_df.columns)\n"
+        "\n"
+        "        # Check if table already exists in target\n"
+        "        table_exists = False\n"
+        "        try:\n"
+        "            tgt_df = spark.read.table(table)\n"
+        "            table_exists = True\n"
+        "            tgt_count = tgt_df.count()\n"
+        "            tgt_cols = set(tgt_df.columns)\n"
+        "        except Exception:\n"
+        "            tgt_count = 0\n"
+        "            tgt_cols = set()\n"
+        "\n"
+        "        if not table_exists:\n"
+        "            # New table — create with full data\n"
+        "            (src_df.write\n"
+        "               .format('delta')\n"
+        "               .mode('overwrite')\n"
+        "               .saveAsTable(table))\n"
+        '            print(f"NEW {table}: created with {src_count} rows, {len(src_cols)} cols")\n'
+        "            synced.append((table, src_count, 'created'))\n"
+        "            continue\n"
+        "\n"
+        "        # ── Schema diff: add new columns if source has more ──\n"
+        "        new_cols = src_cols - tgt_cols\n"
+        "        if new_cols:\n"
+        "            for col_name in new_cols:\n"
+        "                col_type = str(dict(src_df.dtypes).get(col_name, 'string'))\n"
+        '                spark.sql(f"ALTER TABLE {table} ADD COLUMN `{col_name}` {col_type}")\n'
+        '            print(f"  + {table}: added {len(new_cols)} column(s): {new_cols}")\n'
+        "            # Re-read target after schema change\n"
+        "            tgt_df = spark.read.table(table)\n"
+        "            tgt_count = tgt_df.count()\n"
+        "\n"
+        "        # ── Data diff: only sync new/changed rows ──\n"
+        "        if src_count == 0:\n"
+        '            print(f"SKIP {table}: source is empty")\n'
+        "            skipped_empty.append(table)\n"
+        "            continue\n"
+        "\n"
+        "        if tgt_count == 0:\n"
+        "            # Target table exists but is empty — insert all rows\n"
+        "            (src_df.write\n"
+        "               .format('delta')\n"
+        "               .mode('append')\n"
+        "               .option('mergeSchema', 'true')\n"
+        "               .saveAsTable(table))\n"
+        '            print(f"FILL {table}: inserted {src_count} rows (target was empty)")\n'
+        "            synced.append((table, src_count, 'filled'))\n"
+        "            continue\n"
+        "\n"
+        "        # Both have data — find rows in source not in target\n"
+        "        # Use column-level comparison (subtract) for change detection\n"
+        "        common_cols = sorted(list(src_cols & tgt_cols))\n"
+        "        src_subset = src_df.select(common_cols)\n"
+        "        tgt_subset = tgt_df.select(common_cols)\n"
+        "        new_rows = src_subset.subtract(tgt_subset)\n"
+        "        new_count = new_rows.count()\n"
+        "\n"
+        "        if new_count == 0:\n"
+        '            print(f"OK  {table}: in sync ({src_count} rows, no changes)")\n'
+        "            synced.append((table, 0, 'unchanged'))\n"
+        "        else:\n"
+        "            # Write only new/changed rows\n"
+        "            # For full columns, select from source where row matches new_rows\n"
+        "            if src_cols == set(common_cols):\n"
+        "                delta_df = new_rows\n"
+        "            else:\n"
+        "                delta_df = src_df.join(\n"
+        "                    new_rows, on=common_cols, how='inner'\n"
+        "                ).dropDuplicates()\n"
+        "            (delta_df.write\n"
+        "               .format('delta')\n"
+        "               .mode('append')\n"
+        "               .option('mergeSchema', 'true')\n"
+        "               .saveAsTable(table))\n"
+        '            print(f"UPD {table}: appended {new_count} new/changed rows '
+        '(src={src_count}, tgt_before={tgt_count})")\n'
+        "            synced.append((table, new_count, 'incremental'))\n"
         "    except Exception as e:\n"
         '        print(f"ERR {table}: {e}")\n'
         "        failed.append(table)\n\n"
         'print("")\n'
         'print("=" * 60)\n'
-        'print(f"Sync complete: {len(synced)} succeeded, {len(failed)} failed")\n'
-        "for t, r in synced:\n"
-        '    print(f"  {t} : {r} rows")\n'
+        'print(f"Sync complete: {len(synced)} OK, {len(failed)} failed, {len(skipped_empty)} empty")\n'
+        "for t, r, mode in synced:\n"
+        '    print(f"  {t}: {r} rows ({mode})")\n'
         "if failed:\n"
         '    print(f"FAILED: {failed}")\n'
         "    raise Exception(f\"{len(failed)} tables failed: {failed}\")\n"
