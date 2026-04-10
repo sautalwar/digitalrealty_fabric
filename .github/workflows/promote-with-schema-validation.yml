@@ -1,4 +1,4 @@
-name: "🚀 Promote with Schema Validation"
+﻿name: "🚀 Promote with Schema Validation"
 
 on:
   # ── Auto-trigger: fires when schema files change on main ──────────────────
@@ -449,12 +449,7 @@ jobs:
           # Show tables to enforce
           echo "Tables to enforce:"
           if [ -f schema_discovery.json ]; then
-            python3 -c "
-import json
-data = json.load(open('schema_discovery.json'))
-for t, s in data.get('tables', {}).items():
-    print(f'  CREATE TABLE IF NOT EXISTS {t}  ({len(s[\"columns\"])} columns)')
-"
+            python3 -c "import json; d=json.load(open('schema_discovery.json')); [print(f'  {t} ({len(s.get(\"columns\",[]))} cols)') for t,s in d.get('tables',{}).items()]"
           else
             echo "  (schema_discovery.json not found — will use static registry fallback)"
           fi
