@@ -8,3 +8,4 @@
 # Ignore generated artifacts: HTML and PDF outputs
 *.html
 *.pdf
+__pycache__/
