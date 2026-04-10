@@ -218,7 +218,7 @@ jobs:
           echo "  Schema v$SCHEMA_VERSION"
           echo "============================================"
 
-          if [ "$DRY_RUN" = "true" ] || [ "$DEMO_MODE" = "true" ] || [ -z "$PIPELINE_ID" ]; then
+          if [ "$DRY_RUN" = "true" ] || [ "$DEMO_MODE" = "true" ] || [ -z "$PIPELINE_ID" ] || [ "$PIPELINE_ID" = "NOT_CONFIGURED" ]; then
             echo ""
             echo "▶  DRY RUN — would call:"
             echo "   POST https://api.fabric.microsoft.com/v1/deploymentPipelines/$PIPELINE_ID/deploy"
