@@ -495,11 +495,29 @@ jobs:
           # Discover UAT lakehouse ID dynamically
           UAT_LH_ID=""
           if [ -n "$TOKEN" ] && [ "$TOKEN" != "DEMO_TOKEN" ] && [ -n "$WS_ID" ]; then
-            UAT_LH_ID=$(curl -s \
+            # Dynamically find the lakehouse — try to match the one from schema discovery,
+            # then fall back to the first lakehouse with tables, then any lakehouse
+            ALL_LH=$(curl -s \
               -H "Authorization: Bearer $TOKEN" \
-              "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Lakehouse" \
-              | jq -r '.value[] | select(.displayName == "DataCenterLakehouse") | .id // empty' | head -1)
-            echo "UAT Lakehouse ID : $UAT_LH_ID"
+              "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Lakehouse")
+
+            # Try matching lakehouse name from discovery artifact
+            if [ -f schema_discovery.json ]; then
+              DISC_LH_NAME=$(python3 -c "import json; print(json.load(open('schema_discovery.json')).get('lakehouse_name',''))" 2>/dev/null)
+              if [ -n "$DISC_LH_NAME" ]; then
+                UAT_LH_ID=$(echo "$ALL_LH" | jq -r --arg n "$DISC_LH_NAME" '.value[] | select(.displayName == $n) | .id // empty' | head -1)
+                if [ -n "$UAT_LH_ID" ]; then
+                  echo "UAT Lakehouse ID : $UAT_LH_ID (matched discovery: $DISC_LH_NAME)"
+                fi
+              fi
+            fi
+
+            # Fallback: use first lakehouse in target workspace
+            if [ -z "$UAT_LH_ID" ]; then
+              UAT_LH_ID=$(echo "$ALL_LH" | jq -r '.value[0].id // empty')
+              UAT_LH_NAME=$(echo "$ALL_LH" | jq -r '.value[0].displayName // empty')
+              echo "UAT Lakehouse ID : $UAT_LH_ID (first available: $UAT_LH_NAME)"
+            fi
           fi
 
           # Show tables to enforce
@@ -598,10 +616,23 @@ jobs:
                 echo "✅ Notebook definition updated: $NOTEBOOK_ID"
               fi
             else
-              echo "⚠️  Upload returned HTTP $HTTP_CODE — trying to find existing notebook"
+              echo "⚠️  Upload returned HTTP $HTTP_CODE — trying to find and update existing notebook"
               ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
                 "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Notebook")
               NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_sync_to_uat") | .id // empty')
+              if [ -n "$NOTEBOOK_ID" ] && [ -f /tmp/nb_payload.json ]; then
+                echo "📎 Found existing notebook ($NOTEBOOK_ID) — updating definition..."
+                NB_DEF=$(jq '{definition: .definition}' /tmp/nb_payload.json)
+                UPD_RESP=$(curl -s -w "\n%{http_code}" -X POST \
+                  -H "Authorization: Bearer $TOKEN" \
+                  -H "Content-Type: application/json" \
+                  "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items/$NOTEBOOK_ID/updateDefinition" \
+                  -d "$NB_DEF")
+                UPD_HTTP=$(echo "$UPD_RESP" | tail -1)
+                echo "   Update response: HTTP $UPD_HTTP"
+                # Wait for definition update to propagate
+                sleep 5
+              fi
             fi
 
             rm -f /tmp/nb_payload.json

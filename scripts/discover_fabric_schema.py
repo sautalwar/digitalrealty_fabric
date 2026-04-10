@@ -181,11 +181,40 @@ if LAKEHOUSE_NAME:
         names = ", ".join(x["displayName"] for x in lakehouses)
         print(f"ERROR: Lakehouse '{LAKEHOUSE_NAME}' not found. Available: {names}")
         sys.exit(1)
+    candidates = [lh]
 else:
-    lh = lakehouses[0]
+    # Try all lakehouses — pick the first one that has tables
+    candidates = list(lakehouses)
+    print(f"ℹ️  No LAKEHOUSE_NAME specified — will try {len(candidates)} lakehouse(s)")
 
-LH_ID   = lh["id"]
-LH_NAME = lh["displayName"]
+# Find the first lakehouse with tables
+lh = None
+LH_ID = ""
+LH_NAME = ""
+for candidate in candidates:
+    cid = candidate["id"]
+    cname = candidate["displayName"]
+    print(f"  Trying lakehouse: {cname} ({cid})")
+    tables_check = fabric_get(f"/workspaces/{WORKSPACE_ID}/lakehouses/{cid}/tables")
+    tbl_list = tables_check.get("data", []) or tables_check.get("value", [])
+    if not tbl_list:
+        tbl_list = list_tables_via_dfs(WORKSPACE_ID, cid)
+    if tbl_list:
+        lh = candidate
+        LH_ID = cid
+        LH_NAME = cname
+        print(f"  ✅ Found {len(tbl_list)} table(s) in {cname}")
+        break
+    else:
+        print(f"  ⚠️  {cname}: 0 tables — skipping")
+
+if not lh:
+    # Fall back to the first lakehouse even if 0 tables
+    lh = candidates[0]
+    LH_ID = lh["id"]
+    LH_NAME = lh["displayName"]
+    print(f"⚠️  No lakehouse had tables — defaulting to {LH_NAME}")
+
 print(f"✅ Lakehouse: {LH_NAME} ({LH_ID})")
 
 # 2. List tables — try Lakehouse Tables API first, fall back to DFS listing
