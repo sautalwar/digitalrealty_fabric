@@ -517,6 +517,8 @@ jobs:
     name: "🗄️ Enforce Schemas in Target Workspace"
     runs-on: ubuntu-latest
     needs: [preflight, deploy]
+    outputs:
+      uat_table_count: ${{ steps.enforce.outputs.uat_table_count }}
     steps:
       - uses: actions/checkout@v4
 
@@ -550,6 +552,7 @@ jobs:
         continue-on-error: true
 
       - name: "🗄️ Upload & Run Schema Enforcement Notebook"
+        id: enforce
         run: |
           TARGET="${{ env.TARGET_STAGE }}"
           DRY_RUN="${{ env.DRY_RUN_FLAG }}"
@@ -825,6 +828,51 @@ jobs:
               echo "$(echo "$RUN_RESP" | head -n -1)"
               exit 1
             fi
+
+            # ── Post-notebook verification: count tables in UAT lakehouse ──
+            echo ""
+            echo "🔍 Verifying tables in UAT lakehouse after notebook execution..."
+            if [ -n "$UAT_LH_ID" ]; then
+              # Try Lakehouse Tables API first
+              UAT_TABLES=$(curl -s \
+                -H "Authorization: Bearer $TOKEN" \
+                "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/lakehouses/$UAT_LH_ID/tables")
+              UAT_TABLE_COUNT=$(echo "$UAT_TABLES" | jq '.data | length' 2>/dev/null || echo "0")
+
+              if [ "$UAT_TABLE_COUNT" = "0" ] || [ -z "$UAT_TABLE_COUNT" ]; then
+                # Schema-enabled lakehouse: try DFS listing of Tables/dbo/
+                echo "   Tables API returned 0 — trying DFS listing (schema-enabled)..."
+
+                # Get storage token
+                STORAGE_TOKEN=$(curl -s -X POST \
+                  "https://login.microsoftonline.com/${{ secrets.FABRIC_TENANT_ID }}/oauth2/v2.0/token" \
+                  -d "client_id=${{ secrets.FABRIC_CLIENT_ID }}" \
+                  -d "client_secret=${{ secrets.FABRIC_CLIENT_SECRET }}" \
+                  -d "scope=https://storage.azure.com/.default" \
+                  -d "grant_type=client_credentials" | jq -r '.access_token')
+
+                if [ -n "$STORAGE_TOKEN" ] && [ "$STORAGE_TOKEN" != "null" ]; then
+                  DFS_RESP=$(curl -s \
+                    -H "Authorization: Bearer $STORAGE_TOKEN" \
+                    -H "x-ms-version: 2023-01-03" \
+                    "https://onelake.dfs.fabric.microsoft.com/$WS_ID/$UAT_LH_ID?resource=filesystem&directory=Tables/dbo&recursive=false")
+                  UAT_TABLE_COUNT=$(echo "$DFS_RESP" | jq '[.paths[]? | select(.isDirectory == "true" or .isDirectory == true)] | length' 2>/dev/null || echo "0")
+                  echo "   DFS listing (Tables/dbo/): $UAT_TABLE_COUNT table(s)"
+                fi
+              fi
+
+              if [ "$UAT_TABLE_COUNT" -gt 0 ] 2>/dev/null; then
+                echo "✅ UAT lakehouse has $UAT_TABLE_COUNT table(s) after notebook execution"
+                echo "uat_table_count=$UAT_TABLE_COUNT" >> $GITHUB_OUTPUT
+              else
+                echo "⚠️  UAT lakehouse still shows 0 tables after notebook"
+                echo "   This may be due to replication delay — tables may appear shortly"
+                echo "uat_table_count=0" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "⚠️  No UAT lakehouse ID — cannot verify table count"
+              echo "uat_table_count=unknown" >> $GITHUB_OUTPUT
+            fi
           fi
 
   # ───────────────────────────────────────────────────────────
@@ -866,13 +914,24 @@ jobs:
           DRY_RUN="${{ env.DRY_RUN_FLAG }}"
           DEMO_MODE="${{ steps.token.outputs.demo_mode }}"
           WS_ID="${{ needs.preflight.outputs.target_workspace_id }}"
-          TABLE_COUNT="${{ needs.preflight.outputs.table_count }}"
+          CI_TABLE_COUNT="${{ needs.preflight.outputs.table_count }}"
+          UAT_TABLE_COUNT="${{ needs.enforce-schemas.outputs.uat_table_count }}"
 
-          # Skip quality checks when there are 0 tables
-          if [ "$TABLE_COUNT" = "0" ]; then
-            echo "ℹ️  0 tables were enforced — skipping quality checks"
+          # Use actual UAT table count if available, fall back to CI count
+          if [ -n "$UAT_TABLE_COUNT" ] && [ "$UAT_TABLE_COUNT" != "unknown" ] && [ "$UAT_TABLE_COUNT" != "0" ]; then
+            TABLE_COUNT="$UAT_TABLE_COUNT"
+            echo "Using post-notebook UAT table count: $TABLE_COUNT"
+          else
+            TABLE_COUNT="$CI_TABLE_COUNT"
+            echo "Using CI-time table count: $TABLE_COUNT"
+          fi
+
+          # Skip quality checks only when both CI and post-notebook counts are 0
+          if [ "$TABLE_COUNT" = "0" ] && [ "$CI_TABLE_COUNT" = "0" ] && { [ -z "$UAT_TABLE_COUNT" ] || [ "$UAT_TABLE_COUNT" = "0" ] || [ "$UAT_TABLE_COUNT" = "unknown" ]; }; then
+            echo "ℹ️  0 tables in UAT after notebook — skipping quality checks"
             echo "✅  Quality gate skipped (no tables to validate)"
             exit 0
+          fi
           fi
 
           if [ "$DRY_RUN" = "true" ] || [ "$DEMO_MODE" = "true" ] || [ -z "$WS_ID" ] || [[ "$WS_ID" == "<"* ]]; then
