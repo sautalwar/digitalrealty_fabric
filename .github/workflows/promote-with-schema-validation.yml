@@ -1,6 +1,16 @@
 name: "🚀 Promote with Schema Validation"
 
 on:
+  # ── Auto-trigger: fires when schema files change on main ──────────────────
+  push:
+    branches:
+      - main
+    paths:
+      - "notebooks/00_schema_registry.py"   # schema definitions changed
+      - "notebooks/00_apply_schema.py"       # schema enforcer changed
+      - "migrations/**"                      # new migration scripts added
+
+  # ── Manual trigger: use for on-demand promotion or demo ───────────────────
   workflow_dispatch:
     inputs:
       source_stage:
@@ -22,10 +32,24 @@ on:
         required: false
         type: boolean
         default: false
+      schema_version:
+        description: "Schema version label (leave blank to auto-detect)"
+        required: false
+        type: string
+        default: "auto"
 
 concurrency:
   group: fabric-promotion
   cancel-in-progress: false
+
+# ── Defaults: push trigger = Dev→UAT, no dry-run ─────────────────────────────
+# When triggered by push (schema file changed), SOURCE/TARGET/DRY_RUN default
+# to Development → UAT with dry_run=false.  Manual dispatch overrides these.
+env:
+  SOURCE_STAGE:  ${{ github.event.inputs.source_stage || 'Development' }}
+  TARGET_STAGE:  ${{ github.event.inputs.target_stage || 'UAT' }}
+  DRY_RUN_FLAG:  ${{ github.event.inputs.dry_run      || 'false' }}
+  TRIGGER_TYPE:  ${{ github.event_name == 'push' && 'auto (schema change)' || 'manual' }}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SETUP: Required GitHub configuration before running:
@@ -56,7 +80,7 @@ jobs:
     outputs:
       schema_version: ${{ steps.schema.outputs.version }}
       table_count: ${{ steps.schema.outputs.table_count }}
-      dry_run: ${{ github.event.inputs.dry_run }}
+      dry_run: ${{ env.DRY_RUN_FLAG }}
     steps:
       - uses: actions/checkout@v4
 
@@ -100,9 +124,9 @@ jobs:
         run: |
           VERSION="${{ steps.schema.outputs.version }}"
           TABLE_COUNT="${{ steps.schema.outputs.table_count }}"
-          DRY_RUN="${{ github.event.inputs.dry_run }}"
-          SOURCE="${{ github.event.inputs.source_stage }}"
-          TARGET="${{ github.event.inputs.target_stage }}"
+          DRY_RUN="${{ env.DRY_RUN_FLAG }}"
+          SOURCE="${{ env.SOURCE_STAGE }}"
+          TARGET="${{ env.TARGET_STAGE }}"
 
           {
             echo "# 🚀 Schema Promotion Pre-flight"
@@ -172,9 +196,9 @@ jobs:
 
       - name: "🏗️ Trigger Fabric Deployment Pipeline"
         run: |
-          SOURCE="${{ github.event.inputs.source_stage }}"
-          TARGET="${{ github.event.inputs.target_stage }}"
-          DRY_RUN="${{ github.event.inputs.dry_run }}"
+          SOURCE="${{ env.SOURCE_STAGE }}"
+          TARGET="${{ env.TARGET_STAGE }}"
+          DRY_RUN="${{ env.DRY_RUN_FLAG }}"
           PIPELINE_ID="${{ vars.DEPLOYMENT_PIPELINE_ID }}"
           DEMO_MODE="${{ steps.token.outputs.demo_mode }}"
           SCHEMA_VERSION="${{ needs.preflight.outputs.schema_version }}"
@@ -237,10 +261,10 @@ jobs:
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
-            echo "| **Promotion** | \`${{ github.event.inputs.source_stage }}\` → \`${{ github.event.inputs.target_stage }}\` |"
+            echo "| **Promotion** | \`${{ env.SOURCE_STAGE }}\` → \`${{ env.TARGET_STAGE }}\` |"
             echo "| **Schema Version** | \`v${{ needs.preflight.outputs.schema_version }}\` |"
             echo "| **Approved by** | @${{ github.actor }} |"
-            if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            if [ "${{ env.DRY_RUN_FLAG }}" = "true" ]; then
               echo "| **Status** | ⚠️ Dry run — no changes deployed |"
             else
               echo "| **Status** | ✅ Deployment pipeline triggered |"
@@ -282,8 +306,8 @@ jobs:
 
       - name: "🗄️ Upload & Run Schema Enforcement Notebook"
         run: |
-          TARGET="${{ github.event.inputs.target_stage }}"
-          DRY_RUN="${{ github.event.inputs.dry_run }}"
+          TARGET="${{ env.TARGET_STAGE }}"
+          DRY_RUN="${{ env.DRY_RUN_FLAG }}"
           DEMO_MODE="${{ steps.token.outputs.demo_mode }}"
           TOKEN="${{ steps.token.outputs.token }}"
 
@@ -454,8 +478,8 @@ GENEOF
 
       - name: "🔬 Trigger Quality Checks Notebook (03_data_quality_checks)"
         run: |
-          TARGET="${{ github.event.inputs.target_stage }}"
-          DRY_RUN="${{ github.event.inputs.dry_run }}"
+          TARGET="${{ env.TARGET_STAGE }}"
+          DRY_RUN="${{ env.DRY_RUN_FLAG }}"
           DEMO_MODE="${{ steps.token.outputs.demo_mode }}"
 
           case "$TARGET" in
@@ -493,8 +517,8 @@ GENEOF
       - name: "🏷️ Tag Promotion in Git"
         run: |
           SCHEMA_VERSION="${{ needs.preflight.outputs.schema_version }}"
-          TARGET="${{ github.event.inputs.target_stage }}"
-          DRY_RUN="${{ github.event.inputs.dry_run }}"
+          TARGET="${{ env.TARGET_STAGE }}"
+          DRY_RUN="${{ env.DRY_RUN_FLAG }}"
 
           if [ "$DRY_RUN" = "true" ]; then
             echo "DRY RUN — skipping Git tag"
@@ -512,9 +536,9 @@ GENEOF
         run: |
           SCHEMA_VERSION="${{ needs.preflight.outputs.schema_version }}"
           TABLE_COUNT="${{ needs.preflight.outputs.table_count }}"
-          SOURCE="${{ github.event.inputs.source_stage }}"
-          TARGET="${{ github.event.inputs.target_stage }}"
-          DRY_RUN="${{ github.event.inputs.dry_run }}"
+          SOURCE="${{ env.SOURCE_STAGE }}"
+          TARGET="${{ env.TARGET_STAGE }}"
+          DRY_RUN="${{ env.DRY_RUN_FLAG }}"
 
           {
             echo "# ✅ Promotion Complete"
