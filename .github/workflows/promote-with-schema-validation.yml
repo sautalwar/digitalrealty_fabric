@@ -7,7 +7,7 @@ on:
       - main
     paths:
       - "notebooks/00_schema_registry.py"   # schema definitions changed
-      - "notebooks/00_apply_schema.py"       # schema enforcer changed
+      - "notebooks/00_sync_to_uat.py"       # schema enforcer changed
       - "migrations/**"                      # new migration scripts added
 
   # ── Manual trigger: use for on-demand promotion or demo ───────────────────
@@ -83,6 +83,7 @@ jobs:
       dry_run: ${{ env.DRY_RUN_FLAG }}
       source_workspace_id: ${{ steps.resolve_ws.outputs.source_workspace_id }}
       target_workspace_id: ${{ steps.resolve_ws.outputs.target_workspace_id }}
+      source_lakehouse_id: ${{ steps.discover.outputs.source_lakehouse_id }}
     steps:
       - uses: actions/checkout@v4
 
@@ -178,7 +179,7 @@ jobs:
 
             if [ -f schema_discovery.json ]; then
               echo "discovered=true" >> $GITHUB_OUTPUT
-              python3 -c "import json,sys; d=json.load(open('schema_discovery.json')); print(f'✅ Discovered {d[\"table_count\"]} tables from {d[\"lakehouse_name\"]}')"
+              python3 -c "import json,sys; d=json.load(open('schema_discovery.json')); print(f'✅ Discovered {d[\"table_count\"]} tables from {d[\"lakehouse_name\"]}'); print(f'source_lakehouse_id={d[\"lakehouse_id\"]}', file=open(\"$GITHUB_OUTPUT\", \"a\"))"
             else
               echo "⚠️  Schema discovery failed — falling back to static registry"
               echo "discovered=false" >> $GITHUB_OUTPUT
@@ -289,7 +290,7 @@ jobs:
     name: "🚢 Deploy via Fabric Pipeline"
     runs-on: ubuntu-latest
     needs: preflight
-    environment: promotion-approval   # ← approval gate is HERE
+    # No approval gate -- runs automatically after preflight
     steps:
       - uses: actions/checkout@v4
 
@@ -384,7 +385,7 @@ jobs:
 
   # ───────────────────────────────────────────────────────────
   # JOB 3 — Schema Enforcement
-  # Runs 00_apply_schema in the target workspace to create/update tables
+  # Runs 00_sync_to_uat in the target workspace to create/update tables
   # ───────────────────────────────────────────────────────────
   enforce-schemas:
     name: "🗄️ Enforce Schemas in Target Workspace"
@@ -466,11 +467,13 @@ for t, s in data.get('tables', {}).items():
           SCHEMA_FILE="$SCHEMA_FILE_ARG" \
           LAKEHOUSE_ID="$UAT_LH_ID" \
           WORKSPACE_ID="$WS_ID" \
+          SOURCE_WORKSPACE_ID="${{ needs.preflight.outputs.source_workspace_id }}" \
+          SOURCE_LAKEHOUSE_ID="${{ needs.preflight.outputs.source_lakehouse_id }}" \
           python3 scripts/gen_nb_payload.py
 
           if [ "$DRY_RUN" = "true" ] || [ "$DEMO_MODE" = "true" ] || [ -z "$WS_ID" ] || [[ "$WS_ID" == "<"* ]]; then
             echo ""
-            echo "▶  DRY RUN — would upload & trigger: 00_apply_schema"
+            echo "▶  DRY RUN — would upload & trigger: 00_sync_to_uat"
             echo "   Workspace: $TARGET ($WS_ID)"
             echo "   Creates all ${{ needs.preflight.outputs.table_count }} tables via CREATE TABLE IF NOT EXISTS"
             echo ""
@@ -497,7 +500,7 @@ for t, s in data.get('tables', {}).items():
                 sleep 10
                 ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
                   "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Notebook")
-                NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_apply_schema") | .id // empty')
+                NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_sync_to_uat") | .id // empty')
                 if [ -n "$NOTEBOOK_ID" ]; then
                   echo "✅ Notebook ready (attempt $i): $NOTEBOOK_ID"
                   break
@@ -508,7 +511,7 @@ for t, s in data.get('tables', {}).items():
               # Already exists — get its ID and update definition
               ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
                 "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Notebook")
-              NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_apply_schema") | .id // empty')
+              NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_sync_to_uat") | .id // empty')
               if [ -n "$NOTEBOOK_ID" ]; then
                 echo "📎 Notebook exists ($NOTEBOOK_ID) — updating definition..."
                 NB_DEF=$(jq '{definition: .definition}' /tmp/nb_payload.json)
@@ -523,29 +526,57 @@ for t, s in data.get('tables', {}).items():
               echo "⚠️  Upload returned HTTP $HTTP_CODE — trying to find existing notebook"
               ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
                 "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Notebook")
-              NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_apply_schema") | .id // empty')
+              NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_sync_to_uat") | .id // empty')
             fi
 
             rm -f /tmp/nb_payload.json
 
             if [ -z "$NOTEBOOK_ID" ]; then
-              echo "❌ Could not find or create 00_apply_schema notebook in $TARGET"
+              echo "❌ Could not find or create 00_sync_to_uat notebook in $TARGET"
               exit 1
             fi
 
-            # Trigger notebook execution
-            RUN_RESP=$(curl -s -w "\n%{http_code}" -X POST \
+            # Trigger notebook execution and poll for completion
+            RUN_RESP=$(curl -s -w "\n%{http_code}" -D /tmp/run_headers.txt -X POST \
               -H "Authorization: Bearer $TOKEN" \
               -H "Content-Type: application/json" \
               "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items/$NOTEBOOK_ID/jobs/instances?jobType=RunNotebook")
 
             RUN_HTTP=$(echo "$RUN_RESP" | tail -1)
             if [ "$RUN_HTTP" = "202" ] || [ "$RUN_HTTP" = "200" ]; then
-              echo "✅ Schema enforcement notebook triggered in $TARGET"
-              echo "   Tables will appear in Lakehouse within 1-3 minutes"
+              echo "Data sync notebook triggered in $TARGET (HTTP $RUN_HTTP)"
+
+              JOB_LOCATION=$(grep -i "^location:" /tmp/run_headers.txt | tr -d '\r' | awk '{print $2}')
+              echo "   Job location: $JOB_LOCATION"
+
+              if [ -n "$JOB_LOCATION" ]; then
+                echo "   Polling for data sync completion (max 30 min)..."
+                JOB_STATUS=""
+                for attempt in $(seq 1 60); do
+                  sleep 30
+                  JOB_STATUS_RESP=$(curl -s -H "Authorization: Bearer $TOKEN" "$JOB_LOCATION")
+                  JOB_STATUS=$(echo "$JOB_STATUS_RESP" | jq -r '.status // empty')
+                  echo "   Attempt $attempt/60 -- status: $JOB_STATUS"
+                  if [ "$JOB_STATUS" = "Completed" ]; then
+                    echo "Data sync COMPLETE -- all tables and data synced to $TARGET"
+                    break
+                  elif [ "$JOB_STATUS" = "Failed" ] || [ "$JOB_STATUS" = "Cancelled" ]; then
+                    echo "Data sync job $JOB_STATUS"
+                    echo "$JOB_STATUS_RESP" | jq -r '.failureReason // .message // .'
+                    exit 1
+                  fi
+                done
+                if [ "$JOB_STATUS" != "Completed" ]; then
+                  echo "Timed out after 30 min. Check Fabric portal."
+                  exit 1
+                fi
+              else
+                echo "   No Location header -- cannot poll. Check Fabric portal."
+              fi
             else
-              echo "⚠️  Notebook trigger returned HTTP $RUN_HTTP"
+              echo "Notebook trigger returned HTTP $RUN_HTTP"
               echo "$(echo "$RUN_RESP" | head -n -1)"
+              exit 1
             fi
           fi
 
