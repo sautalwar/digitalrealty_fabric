@@ -173,6 +173,11 @@ def list_schema_aware_tables(ws_id, lh_id):
 
     for sname in ordered:
         sub_tables = list_tables_via_dfs(ws_id, lh_id, f"Tables/{sname}")
+        # Filter out system directories that also appear inside schema folders
+        sub_tables = [
+            t for t in sub_tables
+            if t["name"] not in _NON_SCHEMA_DIRS and not t["name"].startswith("_")
+        ]
         if sub_tables:
             return sub_tables, sname
 
