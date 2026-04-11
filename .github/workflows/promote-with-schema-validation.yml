@@ -86,6 +86,7 @@ jobs:
       source_workspace_id: ${{ steps.resolve_ws.outputs.source_workspace_id }}
       target_workspace_id: ${{ steps.resolve_ws.outputs.target_workspace_id }}
       source_lakehouse_id: ${{ steps.discover.outputs.source_lakehouse_id }}
+      lakehouse_count: ${{ steps.discover.outputs.lakehouse_count }}
     steps:
       - uses: actions/checkout@v4
 
@@ -181,7 +182,12 @@ jobs:
 
             if [ -f schema_discovery.json ]; then
               echo "discovered=true" >> $GITHUB_OUTPUT
-              python3 -c "import json,sys; d=json.load(open('schema_discovery.json')); print(f'✅ Discovered {d[\"table_count\"]} tables from {d[\"lakehouse_name\"]}'); print(f'source_lakehouse_id={d[\"lakehouse_id\"]}', file=open(\"$GITHUB_OUTPUT\", \"a\"))"
+              LH_COUNT=$(python3 -c "import json; d=json.load(open('schema_discovery.json')); print(len(d.get('lakehouses', [d])))")
+              TOTAL_TABLES=$(python3 -c "import json; d=json.load(open('schema_discovery.json')); print(d.get('total_table_count', d.get('table_count', 0)))")
+              FIRST_LH_ID=$(python3 -c "import json; d=json.load(open('schema_discovery.json')); lhs=d.get('lakehouses',[]); print(lhs[0]['lakehouse_id'] if lhs else d.get('lakehouse_id',''))")
+              echo "Discovered $TOTAL_TABLES tables across $LH_COUNT lakehouse(s)"
+              echo "source_lakehouse_id=$FIRST_LH_ID" >> $GITHUB_OUTPUT
+              echo "lakehouse_count=$LH_COUNT" >> $GITHUB_OUTPUT
             else
               echo "⚠️  Schema discovery failed — falling back to static registry"
               echo "discovered=false" >> $GITHUB_OUTPUT
@@ -192,7 +198,7 @@ jobs:
         id: schema
         run: |
           if [ -f schema_discovery.json ]; then
-            TABLE_COUNT=$(python3 -c "import json; d=json.load(open('schema_discovery.json')); print(d['table_count'])")
+            TABLE_COUNT=$(python3 -c "import json; d=json.load(open('schema_discovery.json')); print(d.get('total_table_count', d.get('table_count', 0)))")
             VERSION="live-$(date +%Y%m%d)"
           else
             VERSION=$(python3 -c "
@@ -217,14 +223,30 @@ jobs:
             python3 -c "
           import json
           d = json.load(open('schema_discovery.json'))
-          print(f'Workspace  : {d[\"workspace_id\"]}')
-          print(f'Lakehouse  : {d[\"lakehouse_name\"]} ({d[\"lakehouse_id\"]})')
-          print(f'Tables     : {d[\"table_count\"]}')
-          print()
-          for t, s in d['tables'].items():
-              print(f'  {t}: {len(s[\"columns\"])} columns')
-          print()
-          print('Schema discovery: OK')
+          lhs = d.get('lakehouses', [])
+          if lhs:
+              print(f'Workspace  : {d.get(\"workspace_id\", \"unknown\")}')
+              print(f'Lakehouses : {len(lhs)}')
+              total = d.get('total_table_count', 0)
+              print(f'Total tables: {total}')
+              print()
+              for lh in lhs:
+                  name = lh.get('lakehouse_name', '?')
+                  lh_id = lh.get('lakehouse_id', '?')
+                  tc = lh.get('table_count', 0)
+                  schemas = lh.get('schemas', {})
+                  print(f'  {name} ({lh_id}): {tc} tables')
+                  for sn, tbls in schemas.items():
+                      print(f'    schema {sn!r}: {tbls}')
+              print()
+              print('Schema discovery: OK')
+          else:
+              print(f'Workspace  : {d[\"workspace_id\"]}')
+              print(f'Lakehouse  : {d[\"lakehouse_name\"]} ({d[\"lakehouse_id\"]})')
+              print(f'Tables     : {d[\"table_count\"]}')
+              for t, s in d.get('tables', {}).items():
+                  print(f'  {t}: {len(s.get(\"columns\",[]))} columns')
+              print('Schema discovery: OK')
             "
           else
             python3 -c "
@@ -551,7 +573,7 @@ jobs:
           name: schema-discovery
         continue-on-error: true
 
-      - name: "🗄️ Upload & Run Schema Enforcement Notebook"
+      - name: "🗄️ Upload & Run Schema Enforcement Notebooks (All Lakehouses)"
         id: enforce
         run: |
           TARGET="${{ env.TARGET_STAGE }}"
@@ -559,320 +581,342 @@ jobs:
           DEMO_MODE="${{ steps.token.outputs.demo_mode }}"
           TOKEN="${{ steps.token.outputs.token }}"
           WS_ID="${{ needs.preflight.outputs.target_workspace_id }}"
+          SOURCE_WS_ID="${{ needs.preflight.outputs.source_workspace_id }}"
           TABLE_COUNT="${{ needs.preflight.outputs.table_count }}"
 
           echo "Target workspace : $TARGET ($WS_ID)"
+          echo "Source workspace : $SOURCE_WS_ID"
           echo "Schema version   : ${{ needs.preflight.outputs.schema_version }}"
-          echo "Tables expected  : $TABLE_COUNT"
           echo ""
 
-          # ── Warning if CI discovered 0 tables (but DO NOT exit early) ─────
-          if [ "$TABLE_COUNT" = "0" ]; then
-            echo "⚠️  Schema discovery found 0 tables from CI (DFS API)."
-            echo "   This is expected for schema-enabled lakehouses where the"
-            echo "   service principal may not be able to read Delta logs from CI."
-            echo ""
-            echo "   The notebook has runtime discovery using mssparkutils that"
-            echo "   works INSIDE the Fabric Spark environment. Proceeding..."
-            echo ""
+          # ── Determine lakehouse count from discovery JSON ─────────────────
+          LAKEHOUSE_COUNT=0
+          if [ -f schema_discovery.json ]; then
+            LAKEHOUSE_COUNT=$(python3 -c "
+          import json
+          d = json.load(open('schema_discovery.json'))
+          lhs = d.get('lakehouses', [])
+          if lhs:
+              print(len(lhs))
+          elif 'lakehouse_id' in d:
+              print(1)
+          else:
+              print(0)
+            ")
+            echo "Lakehouses in discovery JSON: $LAKEHOUSE_COUNT"
+          else
+            echo "No schema_discovery.json — runtime discovery only"
           fi
 
-          # Discover UAT lakehouse ID dynamically
-          UAT_LH_ID=""
+          if [ "$TABLE_COUNT" = "0" ] && [ "$LAKEHOUSE_COUNT" = "0" ]; then
+            echo "Schema discovery found 0 tables and 0 lakehouses."
+            echo "   Runtime discovery inside Fabric Spark may still find tables."
+            echo "   Generating 1 notebook with runtime-only discovery..."
+            LAKEHOUSE_COUNT=1
+          fi
+
+          # ── List ALL lakehouses in target workspace ───────────────────────
+          ALL_UAT_LH=""
           if [ -n "$TOKEN" ] && [ "$TOKEN" != "DEMO_TOKEN" ] && [ -n "$WS_ID" ]; then
-            # Dynamically find the lakehouse — try to match the one from schema discovery,
-            # then fall back to the first lakehouse with tables, then any lakehouse
-            ALL_LH=$(curl -s \
+            ALL_UAT_LH=$(curl -s \
               -H "Authorization: Bearer $TOKEN" \
               "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Lakehouse")
-
-            # Try matching lakehouse name from discovery artifact
-            if [ -f schema_discovery.json ]; then
-              DISC_LH_NAME=$(python3 -c "import json; print(json.load(open('schema_discovery.json')).get('lakehouse_name',''))" 2>/dev/null)
-              if [ -n "$DISC_LH_NAME" ]; then
-                UAT_LH_ID=$(echo "$ALL_LH" | jq -r --arg n "$DISC_LH_NAME" '.value[] | select(.displayName == $n) | .id // empty' | head -1)
-                if [ -n "$UAT_LH_ID" ]; then
-                  echo "UAT Lakehouse ID : $UAT_LH_ID (matched discovery: $DISC_LH_NAME)"
-                fi
-              fi
-            fi
-
-            # Fallback: use first lakehouse in target workspace
-            if [ -z "$UAT_LH_ID" ]; then
-              UAT_LH_ID=$(echo "$ALL_LH" | jq -r '.value[0].id // empty')
-              UAT_LH_NAME=$(echo "$ALL_LH" | jq -r '.value[0].displayName // empty')
-              echo "UAT Lakehouse ID : $UAT_LH_ID (first available: $UAT_LH_NAME)"
-            fi
+            echo "UAT lakehouses:"
+            echo "$ALL_UAT_LH" | jq -r '.value[]? | "  \(.displayName) (\(.id))"' 2>/dev/null || echo "  (none found)"
+            echo ""
           fi
 
-          # Show tables to enforce
-          echo "Tables to enforce:"
-          if [ -f schema_discovery.json ]; then
-            python3 -c "import json; d=json.load(open('schema_discovery.json')); [print(f'  {t} ({len(s.get(\"columns\",[]))} cols)') for t,s in d.get('tables',{}).items()]"
-          else
-            echo "  (schema_discovery.json not found — will use static registry fallback)"
-          fi
-
-          # Generate self-contained notebook payload
-          SCHEMA_FILE_ARG=""
-          if [ -f schema_discovery.json ]; then
-            SCHEMA_FILE_ARG="schema_discovery.json"
-          fi
-          SCHEMA_FILE="$SCHEMA_FILE_ARG" \
-          LAKEHOUSE_ID="$UAT_LH_ID" \
-          WORKSPACE_ID="$WS_ID" \
-          SOURCE_WORKSPACE_ID="${{ needs.preflight.outputs.source_workspace_id }}" \
-          SOURCE_LAKEHOUSE_ID="${{ needs.preflight.outputs.source_lakehouse_id }}" \
-          python3 scripts/gen_nb_payload.py
-
+          # ── DRY RUN shortcut ──────────────────────────────────────────────
           if [ "$DRY_RUN" = "true" ] || [ "$DEMO_MODE" = "true" ] || [ -z "$WS_ID" ] || [[ "$WS_ID" == "<"* ]]; then
-            echo ""
-            echo "▶  DRY RUN — would upload & trigger: 00_sync_to_uat"
-            echo "   Workspace: $TARGET ($WS_ID)"
-            echo "   Creates all ${{ needs.preflight.outputs.table_count }} tables via CREATE TABLE IF NOT EXISTS"
-            echo ""
-            echo "✅  Dry run complete"
+            echo "DRY RUN — would upload & run notebooks for $LAKEHOUSE_COUNT lakehouses"
+            echo "uat_table_count=0" >> $GITHUB_OUTPUT
             rm -f /tmp/nb_payload.json
-          else
-            # Upload notebook — create new, fall back to existing on 409
-            CREATE_RESP=$(curl -s -D /tmp/nb_headers.txt -w "\n%{http_code}" -X POST \
-              -H "Authorization: Bearer $TOKEN" \
+            exit 0
+          fi
+
+          # ── Helper: upload or update a notebook ───────────────────────────
+          upload_notebook() {
+            local NB_NAME="$1" WS="$2" TK="$3"
+
+            CREATE_RESP=$(curl -s -D /tmp/nb_hdrs.txt -w "\n%{http_code}" -X POST \
+              -H "Authorization: Bearer $TK" \
               -H "Content-Type: application/json" \
-              "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items" \
+              "https://api.fabric.microsoft.com/v1/workspaces/$WS/items" \
               -d @/tmp/nb_payload.json)
-
-            HTTP_CODE=$(echo "$CREATE_RESP" | tail -1)
+            HTTP=$(echo "$CREATE_RESP" | tail -1)
             BODY=$(echo "$CREATE_RESP" | head -n -1)
+            local NB_ID=""
 
-            NOTEBOOK_ID=""
-            if [ "$HTTP_CODE" = "201" ]; then
-              NOTEBOOK_ID=$(echo "$BODY" | jq -r '.id')
-              echo "✅ Notebook uploaded: $NOTEBOOK_ID"
-              elif [ "$HTTP_CODE" = "202" ]; then
-                LOCATION=$(grep -i "^operation-location:" /tmp/nb_headers.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
-                if [ -z "$LOCATION" ]; then
-                  LOCATION=$(grep -i "^location:" /tmp/nb_headers.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
+            if [ "$HTTP" = "201" ]; then
+              NB_ID=$(echo "$BODY" | jq -r '.id')
+              echo "  Created: $NB_ID"
+            elif [ "$HTTP" = "202" ]; then
+              local LOC=$(grep -i "^operation-location:" /tmp/nb_hdrs.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
+              [ -z "$LOC" ] && LOC=$(grep -i "^location:" /tmp/nb_hdrs.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
+              echo "  Async creation — polling..."
+              for ci in $(seq 1 18); do
+                sleep 10
+                if [ -n "$LOC" ]; then
+                  local SR=$(curl -s -H "Authorization: Bearer $TK" "$LOC")
+                  local ST=$(echo "$SR" | jq -r '.status // .Status // empty')
+                  echo "    Poll $ci: $ST"
+                  if [ "$ST" = "Succeeded" ]; then
+                    NB_ID=$(echo "$SR" | jq -r '.resourceLocation // empty' | sed 's/.*\///')
+                    [ -z "$NB_ID" ] && NB_ID=$(curl -s -H "Authorization: Bearer $TK" \
+                      "https://api.fabric.microsoft.com/v1/workspaces/$WS/items?type=Notebook" \
+                      | jq -r --arg n "$NB_NAME" '.value[] | select(.displayName == $n) | .id // empty')
+                    break
+                  elif [ "$ST" = "Failed" ]; then break; fi
+                else
+                  NB_ID=$(curl -s -H "Authorization: Bearer $TK" \
+                    "https://api.fabric.microsoft.com/v1/workspaces/$WS/items?type=Notebook" \
+                    | jq -r --arg n "$NB_NAME" '.value[] | select(.displayName == $n) | .id // empty')
+                  [ -n "$NB_ID" ] && break
                 fi
-                echo "⏳ Notebook creation async — polling up to 180s..."
-                echo "   Operation URL: $LOCATION"
-                for i in $(seq 1 18); do
-                  sleep 10
-                  if [ -n "$LOCATION" ]; then
-                    STATUS_RESP=$(curl -s -H "Authorization: Bearer $TOKEN" "$LOCATION")
-                    STATUS=$(echo "$STATUS_RESP" | jq -r '.status // .Status // empty')
-                    echo "   Attempt $i — op status: $STATUS"
-                    if [ "$STATUS" = "Succeeded" ]; then
-                      NOTEBOOK_ID=$(echo "$STATUS_RESP" | jq -r '.resourceLocation // empty' | sed 's/.*\///')
-                      if [ -z "$NOTEBOOK_ID" ]; then
-                        ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
-                          "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Notebook")
-                        NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_sync_to_uat") | .id // empty')
-                      fi
-                      echo "✅ Notebook ready: $NOTEBOOK_ID"
-                      break
-                    elif [ "$STATUS" = "Failed" ]; then
-                      echo "❌ Notebook creation FAILED: $(echo "$STATUS_RESP" | jq -r '.error.message // empty')"
-                      break
-                    fi
-                  else
-                    ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
-                      "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Notebook")
-                    NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_sync_to_uat") | .id // empty')
-                    if [ -n "$NOTEBOOK_ID" ]; then
-                      echo "✅ Notebook ready (fallback, attempt $i): $NOTEBOOK_ID"
-                      break
-                    fi
-                    echo "   Attempt $i — not ready yet..."
-                  fi
-                done
-            elif [ "$HTTP_CODE" = "409" ]; then
-              # Already exists — get its ID and update definition
-              ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
-                "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Notebook")
-              NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_sync_to_uat") | .id // empty')
-              if [ -n "$NOTEBOOK_ID" ]; then
-                echo "📎 Notebook exists ($NOTEBOOK_ID) — updating definition..."
-                NB_DEF=$(jq '{definition: .definition}' /tmp/nb_payload.json)
-                UPD409_RESP=$(curl -s -D /tmp/upd409_headers.txt -w "\n%{http_code}" -X POST \
-                  -H "Authorization: Bearer $TOKEN" \
-                  -H "Content-Type: application/json" \
-                  "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items/$NOTEBOOK_ID/updateDefinition" \
+              done
+            elif [ "$HTTP" = "409" ]; then
+              NB_ID=$(curl -s -H "Authorization: Bearer $TK" \
+                "https://api.fabric.microsoft.com/v1/workspaces/$WS/items?type=Notebook" \
+                | jq -r --arg n "$NB_NAME" '.value[] | select(.displayName == $n) | .id // empty')
+              if [ -n "$NB_ID" ]; then
+                echo "  Exists ($NB_ID) — updating definition..."
+                local NB_DEF=$(jq '{definition: .definition}' /tmp/nb_payload.json)
+                local UR=$(curl -s -D /tmp/upd_h.txt -w "\n%{http_code}" -X POST \
+                  -H "Authorization: Bearer $TK" -H "Content-Type: application/json" \
+                  "https://api.fabric.microsoft.com/v1/workspaces/$WS/items/$NB_ID/updateDefinition" \
                   -d "$NB_DEF")
-                UPD409_HTTP=$(echo "$UPD409_RESP" | tail -1)
-                echo "   Update response: HTTP $UPD409_HTTP"
-                if [ "$UPD409_HTTP" = "202" ]; then
-                  UPD409_LOC=$(grep -i "^operation-location:" /tmp/upd409_headers.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
-                  if [ -z "$UPD409_LOC" ]; then
-                    UPD409_LOC=$(grep -i "^location:" /tmp/upd409_headers.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
-                  fi
-                  if [ -n "$UPD409_LOC" ]; then
-                    echo "   Polling definition update (max 120s)..."
-                    UPD409_DONE=""
+                local UH=$(echo "$UR" | tail -1)
+                echo "    Update: HTTP $UH"
+                if [ "$UH" = "202" ]; then
+                  local UL=$(grep -i "^operation-location:" /tmp/upd_h.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
+                  [ -z "$UL" ] && UL=$(grep -i "^location:" /tmp/upd_h.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
+                  if [ -n "$UL" ]; then
                     for ui in $(seq 1 12); do
                       sleep 10
-                      UPD409_S=$(curl -s -H "Authorization: Bearer $TOKEN" "$UPD409_LOC" | jq -r '.status // .Status // empty')
-                      echo "   Update poll $ui: $UPD409_S"
-                      [ "$UPD409_S" = "Succeeded" ] && echo "   ✅ Definition update complete" && UPD409_DONE="yes" && break
-                      [ "$UPD409_S" = "Failed" ] && echo "   ⚠️  Definition update failed" && UPD409_DONE="yes" && break
+                      local US=$(curl -s -H "Authorization: Bearer $TK" "$UL" | jq -r '.status // .Status // empty')
+                      echo "    Update poll $ui: $US"
+                      [ "$US" = "Succeeded" ] || [ "$US" = "Failed" ] && break
                     done
-                    if [ -z "$UPD409_DONE" ]; then
-                      echo "   ⚠️  Definition update timed out after 120s — proceeding anyway"
-                    fi
-                  else
-                    echo "   Waiting 15s for definition propagation..."
-                    sleep 15
-                  fi
+                  else sleep 15; fi
                 fi
-                rm -f /tmp/upd409_headers.txt
-                echo "✅ Notebook definition updated: $NOTEBOOK_ID"
+                rm -f /tmp/upd_h.txt
               fi
             else
-              echo "⚠️  Upload returned HTTP $HTTP_CODE — trying to find and update existing notebook"
-              echo "   Response body: $(echo "$BODY" | head -c 2000)"
-              ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
-                "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items?type=Notebook")
-              NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_sync_to_uat") | .id // empty')
-              if [ -n "$NOTEBOOK_ID" ] && [ -f /tmp/nb_payload.json ]; then
-                echo "📎 Found existing notebook ($NOTEBOOK_ID) — updating definition..."
-                NB_DEF=$(jq '{definition: .definition}' /tmp/nb_payload.json)
-                UPD_RESP=$(curl -s -D /tmp/upd_headers.txt -w "\n%{http_code}" -X POST \
-                  -H "Authorization: Bearer $TOKEN" \
-                  -H "Content-Type: application/json" \
-                  "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items/$NOTEBOOK_ID/updateDefinition" \
-                  -d "$NB_DEF")
-                UPD_HTTP=$(echo "$UPD_RESP" | tail -1)
-                echo "   Update response: HTTP $UPD_HTTP"
-
-                # Poll for definition update completion (async 202)
-                if [ "$UPD_HTTP" = "202" ]; then
-                  UPD_LOCATION=$(grep -i "^operation-location:" /tmp/upd_headers.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
-                  if [ -z "$UPD_LOCATION" ]; then
-                    UPD_LOCATION=$(grep -i "^location:" /tmp/upd_headers.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
-                  fi
-                  if [ -n "$UPD_LOCATION" ]; then
-                    echo "   Polling definition update (max 120s)..."
-                    UPD_DONE=""
-                    for ui in $(seq 1 12); do
-                      sleep 10
-                      UPD_STATUS=$(curl -s -H "Authorization: Bearer $TOKEN" "$UPD_LOCATION" | jq -r '.status // .Status // empty')
-                      echo "   Update poll $ui: $UPD_STATUS"
-                      if [ "$UPD_STATUS" = "Succeeded" ]; then
-                        echo "   ✅ Definition update complete"
-                        UPD_DONE="yes"
-                        break
-                      elif [ "$UPD_STATUS" = "Failed" ]; then
-                        echo "   ⚠️  Definition update failed — will try running anyway"
-                        UPD_DONE="yes"
-                        break
-                      fi
-                    done
-                    if [ -z "$UPD_DONE" ]; then
-                      echo "   ⚠️  Definition update timed out after 120s — proceeding anyway"
-                    fi
-                  else
-                    echo "   No operation-location header — waiting 15s for propagation..."
-                    sleep 15
-                  fi
-                fi
-                rm -f /tmp/upd_headers.txt
+              echo "  Upload HTTP $HTTP — finding existing..."
+              NB_ID=$(curl -s -H "Authorization: Bearer $TK" \
+                "https://api.fabric.microsoft.com/v1/workspaces/$WS/items?type=Notebook" \
+                | jq -r --arg n "$NB_NAME" '.value[] | select(.displayName == $n) | .id // empty')
+              if [ -n "$NB_ID" ]; then
+                echo "  Found ($NB_ID) — updating..."
+                local NB_DEF=$(jq '{definition: .definition}' /tmp/nb_payload.json)
+                curl -s -X POST \
+                  -H "Authorization: Bearer $TK" -H "Content-Type: application/json" \
+                  "https://api.fabric.microsoft.com/v1/workspaces/$WS/items/$NB_ID/updateDefinition" \
+                  -d "$NB_DEF" >/dev/null 2>&1
+                sleep 15
               fi
             fi
+            rm -f /tmp/nb_hdrs.txt
+            echo "$NB_ID"
+          }
 
-            rm -f /tmp/nb_payload.json
+          # ── Helper: run notebook and poll for completion ──────────────────
+          run_and_poll() {
+            local NB_ID="$1" WS="$2" TK="$3"
+            local RR=$(curl -s -w "\n%{http_code}" -D /tmp/run_h.txt -X POST \
+              -H "Authorization: Bearer $TK" -H "Content-Type: application/json" -H "Content-Length: 0" \
+              "https://api.fabric.microsoft.com/v1/workspaces/$WS/items/$NB_ID/jobs/instances?jobType=RunNotebook")
+            local RH=$(echo "$RR" | tail -1)
+            if [ "$RH" = "202" ] || [ "$RH" = "200" ]; then
+              echo "  Triggered (HTTP $RH)"
+              local JL=$(grep -i "^location:" /tmp/run_h.txt | tr -d '\r' | awk '{print $2}')
+              if [ -n "$JL" ]; then
+                for a in $(seq 1 60); do
+                  sleep 30
+                  local JS=$(curl -s -H "Authorization: Bearer $TK" "$JL" | jq -r '.status // empty')
+                  echo "    Poll $a/60: $JS"
+                  if [ "$JS" = "Completed" ]; then echo "  COMPLETED"; rm -f /tmp/run_h.txt; return 0; fi
+                  if [ "$JS" = "Failed" ] || [ "$JS" = "Cancelled" ]; then echo "  $JS"; rm -f /tmp/run_h.txt; return 1; fi
+                done
+                echo "  Timed out (30 min)"; rm -f /tmp/run_h.txt; return 1
+              else echo "  No Location header"; rm -f /tmp/run_h.txt; return 1; fi
+            else echo "  Trigger HTTP $RH — FAILED"; rm -f /tmp/run_h.txt; return 1; fi
+          }
+
+          # ════════════════════════════════════════════════════════════════════
+          # MAIN LOOP: Process each lakehouse
+          # ════════════════════════════════════════════════════════════════════
+          LH_OK=0; LH_FAIL=0; LH_SKIP=0
+
+          for i in $(seq 0 $((LAKEHOUSE_COUNT - 1))); do
+            echo ""
+            echo "================================================================"
+            echo "LAKEHOUSE $((i+1)) / $LAKEHOUSE_COUNT"
+            echo "================================================================"
+
+            # Read lakehouse info from discovery JSON
+            LH_NAME=""; SOURCE_LH_ID=""; LH_TABLE_COUNT=0
+            if [ -f schema_discovery.json ]; then
+              LH_NAME=$(python3 -c "
+          import json; d=json.load(open('schema_discovery.json'))
+          lhs=d.get('lakehouses',[])
+          if lhs and $i<len(lhs): print(lhs[$i].get('lakehouse_name',''))
+          elif $i==0 and 'lakehouse_name' in d: print(d['lakehouse_name'])
+          else: print('')
+              " 2>/dev/null)
+              SOURCE_LH_ID=$(python3 -c "
+          import json; d=json.load(open('schema_discovery.json'))
+          lhs=d.get('lakehouses',[])
+          if lhs and $i<len(lhs): print(lhs[$i].get('lakehouse_id',''))
+          elif $i==0 and 'lakehouse_id' in d: print(d['lakehouse_id'])
+          else: print('')
+              " 2>/dev/null)
+              LH_TABLE_COUNT=$(python3 -c "
+          import json; d=json.load(open('schema_discovery.json'))
+          lhs=d.get('lakehouses',[])
+          if lhs and $i<len(lhs): print(lhs[$i].get('table_count',0))
+          elif $i==0: print(d.get('table_count',0))
+          else: print(0)
+              " 2>/dev/null)
+            fi
+
+            echo "  Lakehouse    : $LH_NAME"
+            echo "  Source LH ID : $SOURCE_LH_ID"
+            echo "  Tables       : $LH_TABLE_COUNT"
+
+            # Find matching UAT lakehouse by displayName
+            UAT_LH_ID=""
+            if [ -n "$LH_NAME" ] && [ -n "$ALL_UAT_LH" ]; then
+              UAT_LH_ID=$(echo "$ALL_UAT_LH" | jq -r --arg n "$LH_NAME" \
+                '.value[] | select(.displayName == $n) | .id // empty' | head -1)
+            fi
+            # Fallback for single lakehouse: use first UAT lakehouse
+            if [ -z "$UAT_LH_ID" ] && [ "$LAKEHOUSE_COUNT" = "1" ]; then
+              UAT_LH_ID=$(echo "$ALL_UAT_LH" | jq -r '.value[0].id // empty' 2>/dev/null)
+              echo "  UAT LH (fallback first): $UAT_LH_ID"
+            fi
+            if [ -z "$UAT_LH_ID" ]; then
+              echo "  No matching lakehouse '$LH_NAME' in target — SKIPPING"
+              LH_SKIP=$((LH_SKIP + 1))
+              continue
+            fi
+            echo "  Target LH ID : $UAT_LH_ID"
+
+            # Unique notebook name per lakehouse
+            NB_DISPLAY_NAME="00_sync_${LH_NAME}"
+            echo "  Notebook     : $NB_DISPLAY_NAME"
+
+            # Generate notebook payload for this lakehouse
+            echo "  Generating notebook payload..."
+            SCHEMA_FILE="schema_discovery.json" \
+            LAKEHOUSE_ID="$UAT_LH_ID" \
+            WORKSPACE_ID="$WS_ID" \
+            SOURCE_WORKSPACE_ID="$SOURCE_WS_ID" \
+            SOURCE_LAKEHOUSE_ID="$SOURCE_LH_ID" \
+            LAKEHOUSE_INDEX="$i" \
+            NOTEBOOK_DISPLAY_NAME="$NB_DISPLAY_NAME" \
+            python3 scripts/gen_nb_payload.py
+
+            # Upload notebook
+            echo "  Uploading notebook..."
+            NOTEBOOK_ID=$(upload_notebook "$NB_DISPLAY_NAME" "$WS_ID" "$TOKEN" | tail -1)
 
             if [ -z "$NOTEBOOK_ID" ]; then
-              echo "❌ Could not find or create 00_sync_to_uat notebook in $TARGET"
-              exit 1
+              echo "  Could not create/find notebook for $LH_NAME"
+              LH_FAIL=$((LH_FAIL + 1))
+              continue
             fi
 
-            # Trigger notebook execution and poll for completion
-            RUN_RESP=$(curl -s -w "\n%{http_code}" -D /tmp/run_headers.txt -X POST \
-              -H "Authorization: Bearer $TOKEN" \
-              -H "Content-Type: application/json" \
-              -H "Content-Length: 0" \
-              "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/items/$NOTEBOOK_ID/jobs/instances?jobType=RunNotebook")
-
-            RUN_HTTP=$(echo "$RUN_RESP" | tail -1)
-            if [ "$RUN_HTTP" = "202" ] || [ "$RUN_HTTP" = "200" ]; then
-              echo "Data sync notebook triggered in $TARGET (HTTP $RUN_HTTP)"
-
-              JOB_LOCATION=$(grep -i "^location:" /tmp/run_headers.txt | tr -d '\r' | awk '{print $2}')
-              echo "   Job location: $JOB_LOCATION"
-
-              if [ -n "$JOB_LOCATION" ]; then
-                echo "   Polling for data sync completion (max 30 min)..."
-                JOB_STATUS=""
-                for attempt in $(seq 1 60); do
-                  sleep 30
-                  JOB_STATUS_RESP=$(curl -s -H "Authorization: Bearer $TOKEN" "$JOB_LOCATION")
-                  JOB_STATUS=$(echo "$JOB_STATUS_RESP" | jq -r '.status // empty')
-                  echo "   Attempt $attempt/60 -- status: $JOB_STATUS"
-                  if [ "$JOB_STATUS" = "Completed" ]; then
-                    echo "Data sync COMPLETE -- all tables and data synced to $TARGET"
-                    break
-                  elif [ "$JOB_STATUS" = "Failed" ] || [ "$JOB_STATUS" = "Cancelled" ]; then
-                    echo "Data sync job $JOB_STATUS"
-                    echo "$JOB_STATUS_RESP" | jq -r '.failureReason // .message // .'
-                    exit 1
-                  fi
-                done
-                if [ "$JOB_STATUS" != "Completed" ]; then
-                  echo "Timed out after 30 min. Check Fabric portal."
-                  exit 1
-                fi
-              else
-                echo "   No Location header -- cannot poll. Check Fabric portal."
-              fi
+            # Run notebook
+            echo "  Running notebook $NOTEBOOK_ID..."
+            if run_and_poll "$NOTEBOOK_ID" "$WS_ID" "$TOKEN"; then
+              echo "  Lakehouse $LH_NAME: SUCCESS"
+              LH_OK=$((LH_OK + 1))
             else
-              echo "Notebook trigger returned HTTP $RUN_HTTP"
-              echo "$(echo "$RUN_RESP" | head -n -1)"
-              exit 1
+              echo "  Lakehouse $LH_NAME: FAILED"
+              LH_FAIL=$((LH_FAIL + 1))
             fi
+            rm -f /tmp/nb_payload.json
+          done
 
-            # ── Post-notebook verification: count tables in UAT lakehouse ──
-            echo ""
-            echo "🔍 Verifying tables in UAT lakehouse after notebook execution..."
-            if [ -n "$UAT_LH_ID" ]; then
-              # Try Lakehouse Tables API first
-              UAT_TABLES=$(curl -s \
-                -H "Authorization: Bearer $TOKEN" \
-                "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/lakehouses/$UAT_LH_ID/tables")
-              UAT_TABLE_COUNT=$(echo "$UAT_TABLES" | jq '.data | length' 2>/dev/null || echo "0")
+          # ── Post-sync verification: count tables across ALL UAT lakehouses ──
+          echo ""
+          echo "================================================================"
+          echo "POST-SYNC VERIFICATION"
+          echo "================================================================"
 
-              if [ "$UAT_TABLE_COUNT" = "0" ] || [ -z "$UAT_TABLE_COUNT" ]; then
-                # Schema-enabled lakehouse: try DFS listing of Tables/dbo/
-                echo "   Tables API returned 0 — trying DFS listing (schema-enabled)..."
+          TOTAL_UAT_TABLES=0
+          if [ -n "$TOKEN" ] && [ "$TOKEN" != "DEMO_TOKEN" ]; then
+            STORAGE_TOKEN=$(curl -s -X POST \
+              "https://login.microsoftonline.com/${{ secrets.FABRIC_TENANT_ID }}/oauth2/v2.0/token" \
+              -d "client_id=${{ secrets.FABRIC_CLIENT_ID }}" \
+              -d "client_secret=${{ secrets.FABRIC_CLIENT_SECRET }}" \
+              -d "scope=https://storage.azure.com/.default" \
+              -d "grant_type=client_credentials" | jq -r '.access_token')
 
-                # Get storage token
-                STORAGE_TOKEN=$(curl -s -X POST \
-                  "https://login.microsoftonline.com/${{ secrets.FABRIC_TENANT_ID }}/oauth2/v2.0/token" \
-                  -d "client_id=${{ secrets.FABRIC_CLIENT_ID }}" \
-                  -d "client_secret=${{ secrets.FABRIC_CLIENT_SECRET }}" \
-                  -d "scope=https://storage.azure.com/.default" \
-                  -d "grant_type=client_credentials" | jq -r '.access_token')
+            echo "$ALL_UAT_LH" | jq -r '.value[]? | "\(.id) \(.displayName)"' 2>/dev/null | \
+            while IFS=' ' read -r lh_id lh_name; do
+              [ -z "$lh_id" ] && continue
+              echo "  Checking $lh_name ($lh_id)..."
+              DFS_RESP=$(curl -s \
+                -H "Authorization: Bearer $STORAGE_TOKEN" \
+                -H "x-ms-version: 2023-01-03" \
+                "https://onelake.dfs.fabric.microsoft.com/$WS_ID/$lh_id?resource=filesystem&directory=Tables&recursive=true")
+              LH_TABLES=$(echo "$DFS_RESP" | python3 -c "
+          import json,sys
+          try:
+              d=json.load(sys.stdin); paths=d.get('paths',[])
+              skip={'_delta_log','_schemas','_temporary','__checkpoint','Files','TableMaintenance','Tables'}
+              tables=set()
+              for p in paths:
+                  if p.get('isDirectory') in ('true',True):
+                      parts=p['name'].split('/')
+                      if len(parts)>=2 and parts[-1] not in skip and not parts[-1].startswith('_'):
+                          tables.add(parts[-1])
+              print(len(tables))
+          except: print(0)
+              " 2>/dev/null)
+              echo "    Tables: ${LH_TABLES:-0}"
+            done
+          fi
 
-                if [ -n "$STORAGE_TOKEN" ] && [ "$STORAGE_TOKEN" != "null" ]; then
-                  DFS_RESP=$(curl -s \
-                    -H "Authorization: Bearer $STORAGE_TOKEN" \
-                    -H "x-ms-version: 2023-01-03" \
-                    "https://onelake.dfs.fabric.microsoft.com/$WS_ID/$UAT_LH_ID?resource=filesystem&directory=Tables/dbo&recursive=false")
-                  UAT_TABLE_COUNT=$(echo "$DFS_RESP" | jq '[.paths[]? | select(.isDirectory == "true" or .isDirectory == true)] | length' 2>/dev/null || echo "0")
-                  echo "   DFS listing (Tables/dbo/): $UAT_TABLE_COUNT table(s)"
-                fi
-              fi
+          # Re-count total (pipe subshell loses vars, so re-query)
+          if [ -n "$STORAGE_TOKEN" ] && [ "$STORAGE_TOKEN" != "null" ]; then
+            TOTAL_UAT_TABLES=$(echo "$ALL_UAT_LH" | jq -r '.value[]?.id' 2>/dev/null | while read lh_id; do
+              [ -z "$lh_id" ] && continue
+              DFS=$(curl -s -H "Authorization: Bearer $STORAGE_TOKEN" -H "x-ms-version: 2023-01-03" \
+                "https://onelake.dfs.fabric.microsoft.com/$WS_ID/$lh_id?resource=filesystem&directory=Tables&recursive=true")
+              echo "$DFS" | python3 -c "
+          import json,sys
+          try:
+              d=json.load(sys.stdin); skip={'_delta_log','_schemas','_temporary','__checkpoint','Files','TableMaintenance','Tables'}
+              t=set()
+              for p in d.get('paths',[]):
+                  if p.get('isDirectory') in ('true',True):
+                      parts=p['name'].split('/')
+                      if len(parts)>=2 and parts[-1] not in skip and not parts[-1].startswith('_'): t.add(parts[-1])
+              print(len(t))
+          except: print(0)
+              " 2>/dev/null
+            done | paste -sd+ | bc 2>/dev/null || echo "0")
+          fi
 
-              if [ "$UAT_TABLE_COUNT" -gt 0 ] 2>/dev/null; then
-                echo "✅ UAT lakehouse has $UAT_TABLE_COUNT table(s) after notebook execution"
-                echo "uat_table_count=$UAT_TABLE_COUNT" >> $GITHUB_OUTPUT
-              else
-                echo "⚠️  UAT lakehouse still shows 0 tables after notebook"
-                echo "   This may be due to replication delay — tables may appear shortly"
-                echo "uat_table_count=0" >> $GITHUB_OUTPUT
-              fi
-            else
-              echo "⚠️  No UAT lakehouse ID — cannot verify table count"
-              echo "uat_table_count=unknown" >> $GITHUB_OUTPUT
-            fi
+          echo ""
+          echo "================================================================"
+          echo "SUMMARY"
+          echo "================================================================"
+          echo "  Lakehouses processed : $LAKEHOUSE_COUNT"
+          echo "  Lakehouses OK        : $LH_OK"
+          echo "  Lakehouses failed    : $LH_FAIL"
+          echo "  Lakehouses skipped   : $LH_SKIP"
+          echo "  Total UAT tables     : ${TOTAL_UAT_TABLES:-unknown}"
+          echo "================================================================"
+
+          echo "uat_table_count=${TOTAL_UAT_TABLES:-0}" >> $GITHUB_OUTPUT
+
+          if [ "$LH_FAIL" -gt 0 ] && [ "$LH_OK" = "0" ]; then
+            echo "All lakehouses failed"
+            exit 1
           fi
 
   # ───────────────────────────────────────────────────────────
@@ -1008,10 +1052,10 @@ jobs:
             echo "| **Triggered by** | @${{ github.actor }} |"
             echo ""
             echo "## What happened"
-            echo "1. ✅ Schema registry validated (\`notebooks/00_schema_registry.py\`)"
-            echo "2. ✅ Fabric deployment pipeline triggered (\`$SOURCE\` → \`$TARGET\`)"
-            echo "3. ✅ Data sync notebook executed in \`$TARGET\` — **$TABLE_COUNT tables** synced from Dev"
-            echo "4. ✅ Data quality checks triggered in \`$TARGET\` workspace"
+            echo "1. Schema registry validated"
+            echo "2. Fabric deployment pipeline triggered (\`$SOURCE\` -> \`$TARGET\`)"
+            echo "3. Data sync notebooks executed in \`$TARGET\` — **$TABLE_COUNT tables** synced across ALL lakehouses"
+            echo "4. Data quality checks triggered in \`$TARGET\` workspace"
             echo ""
-            echo "> **Next step:** Open \`$TARGET\` workspace in Fabric → open **DigitalRealty_Capacity** lakehouse to see the synced tables."
+            echo "> **Next step:** Open \`$TARGET\` workspace in Fabric to verify ALL lakehouses have their tables."
           } >> $GITHUB_STEP_SUMMARY

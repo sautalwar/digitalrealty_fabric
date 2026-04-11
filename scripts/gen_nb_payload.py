@@ -23,25 +23,57 @@ LAKEHOUSE_ID        = os.environ.get("LAKEHOUSE_ID", "")
 WORKSPACE_ID        = os.environ.get("WORKSPACE_ID", "")
 SOURCE_WORKSPACE_ID = os.environ.get("SOURCE_WORKSPACE_ID", "")
 SOURCE_LAKEHOUSE_ID = os.environ.get("SOURCE_LAKEHOUSE_ID", "")
+LAKEHOUSE_INDEX     = int(os.environ.get("LAKEHOUSE_INDEX", "0"))
+NOTEBOOK_DISPLAY_NAME = os.environ.get("NOTEBOOK_DISPLAY_NAME", "00_sync_to_uat")
 OUT_PATH            = os.environ.get("OUT_PATH", "/tmp/nb_payload.json")
 
 # ── Load schema / table list ───────────────────────────────────────────────────
+# SCHEMA_TABLES: {schema_name: [table_name, ...]}  e.g. {"dbo": ["t1"], "year_2017": ["t2"]}
+SCHEMA_TABLES = {}
+SCHEMAS_ENABLED = False
+
 if SCHEMA_FILE and os.path.isfile(SCHEMA_FILE):
     disc = json.load(open(SCHEMA_FILE))
     SCHEMA_VERSION = f"live-{disc.get('workspace_id','')[:8]}"
-    TABLES = list(disc.get("tables", {}).keys())
-    SCHEMAS_ENABLED = disc.get("schemas_enabled", False)
-    DEFAULT_SCHEMA = disc.get("default_schema", "dbo")
-    # Sanitise: "Files" is a storage area, not a valid schema name
-    if not DEFAULT_SCHEMA or DEFAULT_SCHEMA == "Files":
-        DEFAULT_SCHEMA = "dbo"
-    if not SOURCE_LAKEHOUSE_ID:
-        SOURCE_LAKEHOUSE_ID = disc.get("lakehouse_id", "")
-    if not SOURCE_WORKSPACE_ID:
-        SOURCE_WORKSPACE_ID = disc.get("workspace_id", "")
-    print(f"Schema source   : {SCHEMA_FILE} ({len(TABLES)} tables)")
-    if SCHEMAS_ENABLED:
-        print(f"Schemas enabled : yes (default schema: {DEFAULT_SCHEMA})")
+
+    # New multi-lakehouse format
+    if "lakehouses" in disc:
+        lh_list = disc["lakehouses"]
+        if LAKEHOUSE_INDEX < len(lh_list):
+            lh_info = lh_list[LAKEHOUSE_INDEX]
+        else:
+            print(f"WARNING: LAKEHOUSE_INDEX {LAKEHOUSE_INDEX} out of range ({len(lh_list)} lakehouses)")
+            lh_info = lh_list[0] if lh_list else {}
+
+        SCHEMAS_ENABLED = lh_info.get("schemas_enabled", False)
+        for schema_name, schema_data in lh_info.get("schemas", {}).items():
+            tables = list(schema_data.get("tables", {}).keys())
+            if tables:
+                SCHEMA_TABLES[schema_name] = tables
+
+        if not SOURCE_LAKEHOUSE_ID:
+            SOURCE_LAKEHOUSE_ID = lh_info.get("lakehouse_id", "")
+        if not SOURCE_WORKSPACE_ID:
+            SOURCE_WORKSPACE_ID = disc.get("workspace_id", "")
+
+        total_tables = sum(len(v) for v in SCHEMA_TABLES.values())
+        print(f"Schema source   : {SCHEMA_FILE} (lakehouse #{LAKEHOUSE_INDEX}: {lh_info.get('lakehouse_name', '?')})")
+        print(f"  Schemas       : {list(SCHEMA_TABLES.keys())}")
+        print(f"  Total tables  : {total_tables}")
+
+    # Legacy single-lakehouse format
+    else:
+        TABLES = list(disc.get("tables", {}).keys())
+        SCHEMAS_ENABLED = disc.get("schemas_enabled", False)
+        DEFAULT_SCHEMA = disc.get("default_schema", "dbo")
+        if not DEFAULT_SCHEMA or DEFAULT_SCHEMA == "Files":
+            DEFAULT_SCHEMA = "dbo"
+        SCHEMA_TABLES = {DEFAULT_SCHEMA: TABLES} if SCHEMAS_ENABLED else {"": TABLES}
+        if not SOURCE_LAKEHOUSE_ID:
+            SOURCE_LAKEHOUSE_ID = disc.get("lakehouse_id", "")
+        if not SOURCE_WORKSPACE_ID:
+            SOURCE_WORKSPACE_ID = disc.get("workspace_id", "")
+        print(f"Schema source   : {SCHEMA_FILE} (legacy format, {len(TABLES)} tables)")
 else:
     repo_root = os.path.join(os.path.dirname(__file__), "..")
     registry_path = os.path.join(repo_root, "notebooks", "00_schema_registry.py")
@@ -50,31 +82,30 @@ else:
     SCHEMA_VERSION = ns["SCHEMA_VERSION"]
     TABLES = list(ns["SCHEMAS"].keys())
     SCHEMAS_ENABLED = False
-    DEFAULT_SCHEMA = "dbo"
+    SCHEMA_TABLES = {"": TABLES}
     print(f"Schema source   : 00_schema_registry.py (static fallback, {len(TABLES)} tables)")
 
 print(f"Source workspace: {SOURCE_WORKSPACE_ID}")
 print(f"Source lakehouse: {SOURCE_LAKEHOUSE_ID}")
 print(f"Target workspace: {WORKSPACE_ID}")
 print(f"Target lakehouse: {LAKEHOUSE_ID}")
+print(f"Notebook name   : {NOTEBOOK_DISPLAY_NAME}")
 
 # ── Build PySpark notebook code ────────────────────────────────────────────────
 has_source = bool(SOURCE_WORKSPACE_ID and SOURCE_LAKEHOUSE_ID)
 
 if has_source:
-    ci_tables_repr = repr(TABLES)  # may be [] if CI discovery returned 0 tables
+    ci_schema_tables_repr = repr(SCHEMA_TABLES)
     schemas_enabled_repr = repr(SCHEMAS_ENABLED)
-    default_schema_repr = repr(DEFAULT_SCHEMA)
     inner_code = (
-        "# Auto-generated — Digital Realty Full Data Sync\n"
+        "# Auto-generated — Digital Realty Full Data Sync (Multi-Schema)\n"
         "# Reads from Dev OneLake -> writes to this workspace lakehouse\n"
         f"# Schema version: {SCHEMA_VERSION}\n"
         "import time as _time\n\n"
         f'DEV_WS_ID = "{SOURCE_WORKSPACE_ID}"\n'
         f'DEV_LH_ID = "{SOURCE_LAKEHOUSE_ID}"\n'
-        f"CI_TABLES = {ci_tables_repr}  # from CI schema discovery (may be empty)\n"
-        f"SCHEMAS_ENABLED = {schemas_enabled_repr}\n"
-        f"DEFAULT_SCHEMA = {default_schema_repr}\n\n"
+        f"CI_SCHEMA_TABLES = {ci_schema_tables_repr}  # from CI discovery\n"
+        f"SCHEMAS_ENABLED = {schemas_enabled_repr}\n\n"
         "# ── Helper: readable size ──\n"
         "def _fmt_bytes(n):\n"
         "    for unit in ['B','KB','MB','GB']:\n"
@@ -105,8 +136,7 @@ if has_source:
         'print(f"Source workspace : {DEV_WS_ID}")\n'
         'print(f"Source lakehouse : {DEV_LH_ID}")\n'
         'print(f"Schemas enabled  : {SCHEMAS_ENABLED}")\n'
-        'print(f"Default schema   : {DEFAULT_SCHEMA}")\n'
-        'print(f"CI tables        : {len(CI_TABLES)} -> {CI_TABLES}")\n'
+        'print(f"CI schemas/tables: {len(CI_SCHEMA_TABLES)} schema(s) -> {CI_SCHEMA_TABLES}")\n'
         'try:\n'
         '    print(f"Spark version    : {spark.version}")\n'
         'except Exception:\n'
@@ -116,7 +146,7 @@ if has_source:
         'except NameError:\n'
         '    print("mssparkutils     : NOT available")\n'
         'print("")\n\n'
-        "# Runtime discovery\n"
+        "# Runtime discovery builds SCHEMA_TABLES dict: {schema: [tables]}\n"
         'dev_base_path = f"abfss://{DEV_WS_ID}@onelake.dfs.fabric.microsoft.com/{DEV_LH_ID}/Tables"\n'
         'print(f"OneLake base path: {dev_base_path}")\n\n'
         "_SKIP_DIRS = {'_delta_log', '_schemas', '_temporary', '__checkpoint', 'Files', 'TableMaintenance', 'Tables'}\n\n"
@@ -133,31 +163,32 @@ if has_source:
         "    except Exception as ex:\n"
         '        print(f"     FAILED: {ex}")\n'
         "        return []\n\n"
-        "TABLES = []\n"
-        "SCHEMAS_TO_TRY = ['dbo']\n"
-        "if DEFAULT_SCHEMA and DEFAULT_SCHEMA != 'dbo':\n"
-        "    SCHEMAS_TO_TRY.append(DEFAULT_SCHEMA)\n\n"
-        'print(f"\\n--- Discovery Strategy 1: schema-prefixed paths ---")\n'
-        "for schema in SCHEMAS_TO_TRY:\n"
-        '    path = f"{dev_base_path}/{schema}"\n'
+        "SCHEMA_TABLES = {}  # {schema_name: [table_names]}\n\n"
+        "# Strategy 1: try schemas known from CI discovery\n"
+        'print(f"\\n--- Discovery Strategy 1: CI-known schemas ---")\n'
+        "for ci_schema in sorted(CI_SCHEMA_TABLES.keys()):\n"
+        "    if ci_schema:  # non-empty schema name\n"
+        '        path = f"{dev_base_path}/{ci_schema}"\n'
+        "        found = _try_list(path)\n"
+        "        if found:\n"
+        "            SCHEMA_TABLES[ci_schema] = found\n"
+        '            print(f"  [FOUND] {len(found)} tables via Tables/{ci_schema}/")\n'
+        "    else:  # empty schema = no schema prefix\n"
+        "        found = _try_list(dev_base_path)\n"
+        "        if found:\n"
+        '            SCHEMA_TABLES[""] = found\n'
+        '            print(f"  [FOUND] {len(found)} tables in Tables/ (no schema)")\n\n'
+        "# Strategy 2: try dbo if not already found\n"
+        "if 'dbo' not in SCHEMA_TABLES:\n"
+        '    print(f"\\n--- Discovery Strategy 2: dbo schema ---")\n'
+        '    path = f"{dev_base_path}/dbo"\n'
         "    found = _try_list(path)\n"
         "    if found:\n"
-        "        TABLES = found\n"
-        "        dev_tables_path = path\n"
-        "        SCHEMAS_ENABLED = True\n"
-        "        DEFAULT_SCHEMA = schema\n"
-        '        print(f"  [FOUND] {len(TABLES)} tables via Tables/{schema}/")\n'
-        "        break\n\n"
-        "if not TABLES:\n"
-        '    print(f"\\n--- Discovery Strategy 2: direct Tables/ ---")\n'
-        "    found = _try_list(dev_base_path)\n"
-        "    if found:\n"
-        "        TABLES = found\n"
-        "        dev_tables_path = dev_base_path\n"
-        "        SCHEMAS_ENABLED = False\n"
-        '        print(f"  [FOUND] {len(TABLES)} tables in Tables/ (no schema)")\n\n'
-        "if not TABLES:\n"
-        '    print(f"\\n--- Discovery Strategy 3: enumerate schema folders ---")\n'
+        "        SCHEMA_TABLES['dbo'] = found\n"
+        '        print(f"  [FOUND] {len(found)} tables in Tables/dbo/")\n\n'
+        "# Strategy 3: enumerate ALL schema dirs (NO BREAK — collect all)\n"
+        "if not SCHEMA_TABLES:\n"
+        '    print(f"\\n--- Discovery Strategy 3: enumerate ALL schema folders ---")\n'
         "    try:\n"
         "        schema_entries = mssparkutils.fs.ls(dev_base_path)\n"
         "        schema_dirs = [e.name.rstrip('/') for e in schema_entries if e.isDir]\n"
@@ -169,51 +200,56 @@ if has_source:
         '            path = f"{dev_base_path}/{sd}"\n'
         "            found = _try_list(path)\n"
         "            if found:\n"
-        "                TABLES = found\n"
-        "                dev_tables_path = path\n"
-        "                SCHEMAS_ENABLED = True\n"
-        "                DEFAULT_SCHEMA = sd\n"
-        '                print(f"  [FOUND] {len(TABLES)} tables in Tables/{sd}/")\n'
-        "                break\n"
+        "                SCHEMA_TABLES[sd] = found\n"
+        '                print(f"  [FOUND] {len(found)} tables in Tables/{sd}/")\n'
         "    except Exception as ex:\n"
         '        print(f"  Strategy 3 failed: {ex}")\n\n'
-        "if not TABLES and CI_TABLES:\n"
-        '    print(f"\\n--- Discovery Strategy 4: CI table list ---")\n'
-        "    TABLES = CI_TABLES\n"
-        "    if SCHEMAS_ENABLED:\n"
-        '        dev_tables_path = f"{dev_base_path}/{DEFAULT_SCHEMA}"\n'
-        "    else:\n"
-        "        dev_tables_path = dev_base_path\n"
-        '    print(f"  Using CI table list: {TABLES}")\n\n'
-        "if not TABLES:\n"
+        "# Strategy 4: direct Tables/ (no schema prefix)\n"
+        "if not SCHEMA_TABLES:\n"
+        '    print(f"\\n--- Discovery Strategy 4: direct Tables/ ---")\n'
+        "    found = _try_list(dev_base_path)\n"
+        "    if found:\n"
+        '        SCHEMA_TABLES[""] = found\n'
+        '        print(f"  [FOUND] {len(found)} tables in Tables/ (no schema)")\n\n'
+        "# Strategy 5: CI table list fallback\n"
+        "if not SCHEMA_TABLES and CI_SCHEMA_TABLES:\n"
+        '    print(f"\\n--- Discovery Strategy 5: CI table list fallback ---")\n'
+        "    SCHEMA_TABLES = dict(CI_SCHEMA_TABLES)\n"
+        '    print(f"  Using CI table list: {SCHEMA_TABLES}")\n\n'
+        "total_table_count = sum(len(v) for v in SCHEMA_TABLES.values())\n"
+        "if total_table_count == 0:\n"
         '    print("\\n" + "!" * 72)\n'
-        '    print("NO TABLES FOUND — nothing to sync.")\n'
-        '    print("All 4 discovery strategies returned 0 tables.")\n'
+        '    print("NO TABLES FOUND -- nothing to sync.")\n'
+        '    print("All 5 discovery strategies returned 0 tables.")\n'
         '    print("Check: Does the source lakehouse have tables?")\n'
         '    print("Check: Does the service principal have OneLake read access?")\n'
         '    print("!" * 72)\n'
         '    print("RESULT: 0 tables synced")\n'
         "    # Do NOT call mssparkutils.notebook.exit() — Fabric treats it as failure\n\n"
-        "if TABLES:\n"
-        "    tbl_prefix = f'{DEFAULT_SCHEMA}.' if SCHEMAS_ENABLED else ''\n\n"
+        "if total_table_count > 0:\n"
+        "    _sync_pairs = []\n"
+        "    for _sn, _tl in sorted(SCHEMA_TABLES.items()):\n"
+        "        for _t in _tl:\n"
+        "            _sync_pairs.append((_sn, _t))\n\n"
         '    print("")\n'
         '    print("=" * 72)\n'
-        '    print(f"STARTING SYNC: {len(TABLES)} tables")\n'
-        '    print(f"Source path    : {dev_tables_path}")\n'
-        '    print(f"Table prefix   : {tbl_prefix!r} (schemas_enabled={SCHEMAS_ENABLED})")\n'
-        '    print(f"Tables to sync : {TABLES}")\n'
+        '    print(f"STARTING SYNC: {total_table_count} tables across {len(SCHEMA_TABLES)} schema(s)")\n'
+        "    for _sn, _tl in sorted(SCHEMA_TABLES.items()):\n"
+        '        print(f"  Schema {_sn!r}: {_tl}")\n'
         '    print("=" * 72)\n\n'
         "    synced, failed, skipped_empty = [], [], []\n"
         "    total_rows_copied = 0\n"
         "    total_cols_added = 0\n\n"
-        "    for idx, table in enumerate(TABLES, 1):\n"
+        "    for idx, (schema_name, table) in enumerate(_sync_pairs, 1):\n"
+        "        tbl_prefix = f'{schema_name}.' if schema_name else ''\n"
+        "        source_path = f'{dev_base_path}/{schema_name}' if schema_name else dev_base_path\n"
         '        t_start = _time.time()\n'
         '        print("")\n'
         '        print("-" * 72)\n'
-        '        print(f"[{idx}/{len(TABLES)}] TABLE: {table}")\n'
+        '        print(f"[{idx}/{total_table_count}] TABLE: {tbl_prefix}{table} (schema={schema_name!r})")\n'
         '        print("-" * 72)\n'
         "        try:\n"
-        '            src = f"{dev_tables_path}/{table}"\n'
+        '            src = f"{source_path}/{table}"\n'
         '            print(f"  Reading source: {src}")\n'
         "            src_df = spark.read.format('delta').load(src)\n"
         "            src_count = src_df.count()\n"
@@ -340,7 +376,7 @@ if has_source:
         '    print("=" * 72)\n'
         '    print("SYNC SUMMARY")\n'
         '    print("=" * 72)\n'
-        '    print(f"Tables synced      : {len(synced)}/{len(TABLES)}")\n'
+        '    print(f"Tables synced      : {len(synced)}/{total_table_count}")\n'
         '    print(f"Tables failed      : {len(failed)}")\n'
         '    print(f"Tables skipped     : {len(skipped_empty)} (empty source)")\n'
         '    print(f"Total rows copied  : {total_rows_copied:,}")\n'
@@ -362,20 +398,26 @@ if has_source:
     )
 else:
     # Fallback DDL-only when source IDs are unknown
+    _all_tables = []
+    for _st in SCHEMA_TABLES.values():
+        _all_tables.extend(_st)
     inner_code = (
         "# Auto-generated — Digital Realty Schema Enforcement (DDL only)\n"
         "# WARNING: SOURCE_WORKSPACE_ID or SOURCE_LAKEHOUSE_ID not provided\n"
         f"# Schema version: {SCHEMA_VERSION}\n\n"
-        f"TABLES = {repr(TABLES)}\n\n"
+        f"SCHEMA_TABLES = {repr(SCHEMA_TABLES)}\n\n"
         "created, skipped = [], []\n"
-        "for table in TABLES:\n"
-        "    try:\n"
-        "        spark.sql(f'CREATE TABLE IF NOT EXISTS {table} USING DELTA')\n"
-        "        created.append(table)\n"
-        '        print(f"OK: {table}")\n'
-        "    except Exception as e:\n"
-        '        print(f"SKIP: {table}: {e}")\n'
-        "        skipped.append(table)\n\n"
+        "for schema_name, tables in SCHEMA_TABLES.items():\n"
+        "    prefix = f'{schema_name}.' if schema_name else ''\n"
+        "    for table in tables:\n"
+        "        full = f'{prefix}{table}'\n"
+        "        try:\n"
+        "            spark.sql(f'CREATE TABLE IF NOT EXISTS {full} USING DELTA')\n"
+        "            created.append(full)\n"
+        '            print(f"OK: {full}")\n'
+        "        except Exception as e:\n"
+        '            print(f"SKIP: {full}: {e}")\n'
+        "            skipped.append(full)\n\n"
         "print(f'DDL enforcement complete: {len(created)} tables')\n"
         "if skipped:\n"
         "    print(f'Skipped: {skipped}')\n"
@@ -420,7 +462,7 @@ notebook = {
 
 # ── Write payload ──────────────────────────────────────────────────────────────
 payload = {
-    "displayName": "00_sync_to_uat",
+    "displayName": NOTEBOOK_DISPLAY_NAME,
     "type": "Notebook",
     "definition": {
         "format": "ipynb",
