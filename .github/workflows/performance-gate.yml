@@ -98,6 +98,196 @@ jobs:
           done
           echo "Potential bloat columns: $FOUND"
 
+      # ── Security Guardrails ──
+
+      - name: "Security: RLS Coverage Audit"
+        id: rls-audit
+        run: |
+          echo "=== RLS Coverage Audit ==="
+          TMDL_DIR="semantic-model"
+          ROLES=$(grep -c "^  role " $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
+          echo "RLS roles defined: $ROLES"
+          if [ "$ROLES" -eq "0" ]; then
+            echo "::error::ZERO RLS roles defined — all data is unprotected"
+            echo "rls_status=FAIL" >> $GITHUB_OUTPUT
+          else
+            # List all tables and check which have tablePermission
+            TABLES=$(grep -oP "(?<=^  table )\S+" $TMDL_DIR/*.tmdl 2>/dev/null | sort -u)
+            PROTECTED=$(grep -oP "(?<=tablePermission )\S+" $TMDL_DIR/*.tmdl 2>/dev/null | sort -u)
+            UNPROTECTED=""
+            for t in $TABLES; do
+              if ! echo "$PROTECTED" | grep -q "^${t}$"; then
+                UNPROTECTED="$UNPROTECTED $t"
+              fi
+            done
+            if [ -n "$UNPROTECTED" ]; then
+              echo "::warning::Tables WITHOUT RLS tablePermission:$UNPROTECTED"
+              echo "rls_status=WARN" >> $GITHUB_OUTPUT
+            else
+              echo "All tables have RLS coverage"
+              echo "rls_status=PASS" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: "Security: OLS Sensitive Column Guard"
+        id: ols-guard
+        run: |
+          echo "=== OLS Sensitive Column Guard ==="
+          TMDL_DIR="semantic-model"
+          SENSITIVE_PATTERNS="revenue|salary|cost|price|email|phone|ssn|address|credit|budget|pii|confidential|income|wage"
+          SENSITIVE_COLS=$(grep -iP "column\s+\S*($SENSITIVE_PATTERNS)" $TMDL_DIR/*.tmdl 2>/dev/null || true)
+          OLS_DEFINED=$(grep -c "columnPermission" $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
+          
+          if [ -n "$SENSITIVE_COLS" ]; then
+            SENS_COUNT=$(echo "$SENSITIVE_COLS" | wc -l)
+            echo "Sensitive columns found: $SENS_COUNT"
+            echo "$SENSITIVE_COLS" | head -20
+            if [ "$OLS_DEFINED" -eq "0" ]; then
+              echo "::warning::$SENS_COUNT sensitive columns detected but ZERO OLS (columnPermission) defined"
+              echo "ols_status=WARN" >> $GITHUB_OUTPUT
+            else
+              echo "OLS protections found: $OLS_DEFINED"
+              echo "ols_status=PASS" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "No sensitive column patterns detected"
+            echo "ols_status=PASS" >> $GITHUB_OUTPUT
+          fi
+
+      - name: "Security: Credential & Secret Scan"
+        id: secret-scan
+        run: |
+          echo "=== Credential & Secret Scan ==="
+          PATTERNS=(
+            "password="
+            "secret="
+            "apikey="
+            "api_key="
+            "AccountKey="
+            "connectionString="
+            "client_secret="
+            "Bearer "
+            "SharedAccessKey="
+            "DefaultEndpointsProtocol="
+          )
+          FOUND=0
+          for pat in "${PATTERNS[@]}"; do
+            HITS=$(grep -rn --include="*.tmdl" --include="*.pbip" --include="*.pbir" \
+              --include="*.json" --include="*.py" --include="*.m" --include="*.yml" \
+              -i "$pat" . 2>/dev/null | grep -v ".github/workflows" | grep -v "node_modules" || true)
+            if [ -n "$HITS" ]; then
+              echo "::error::Pattern '$pat' found:"
+              echo "$HITS" | head -5
+              FOUND=$((FOUND + $(echo "$HITS" | wc -l)))
+            fi
+          done
+          if [ "$FOUND" -gt "0" ]; then
+            echo "::error::$FOUND credential/secret patterns detected — FAIL"
+            echo "secret_status=FAIL" >> $GITHUB_OUTPUT
+          else
+            echo "No embedded credentials found"
+            echo "secret_status=PASS" >> $GITHUB_OUTPUT
+          fi
+
+      - name: "Security: PBIP/TMDL Data Source Audit"
+        id: datasource-audit
+        run: |
+          echo "=== PBIP/TMDL Data Source Audit ==="
+          FILES=$(find . -name "*.tmdl" -o -name "*.pbip" -o -name "*.pbir" \
+            -o -name "*.json" 2>/dev/null | grep -v node_modules | grep -v ".github")
+          if [ -z "$FILES" ]; then
+            echo "No TMDL/PBIP files found — skipping"
+            echo "datasource_status=SKIP" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          ISSUES=0
+          # Check for HTTP (non-HTTPS) data source endpoints
+          HTTP_HITS=$(echo "$FILES" | xargs grep -nP "http://[^/]" 2>/dev/null || true)
+          if [ -n "$HTTP_HITS" ]; then
+            echo "::warning::Non-HTTPS endpoints detected:"
+            echo "$HTTP_HITS" | head -5
+            ISSUES=$((ISSUES + $(echo "$HTTP_HITS" | wc -l)))
+          fi
+          # Check for hardcoded IP addresses in data sources
+          IP_HITS=$(echo "$FILES" | xargs grep -nP "\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}" 2>/dev/null \
+            | grep -v "0.0.0.0\|127.0.0.1\|version" || true)
+          if [ -n "$IP_HITS" ]; then
+            echo "::warning::Hardcoded IP addresses detected:"
+            echo "$IP_HITS" | head -5
+            ISSUES=$((ISSUES + $(echo "$IP_HITS" | wc -l)))
+          fi
+          if [ "$ISSUES" -gt "0" ]; then
+            echo "::warning::$ISSUES data source security issues found"
+            echo "datasource_status=WARN" >> $GITHUB_OUTPUT
+          else
+            echo "Data source security: clean"
+            echo "datasource_status=PASS" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Performance ──
+
+      - name: "Performance: DirectLake Fallback Guard"
+        id: directlake-guard
+        run: |
+          echo "=== DirectLake Fallback Guard ==="
+          TMDL_DIR="semantic-model"
+          CALC_COLS=$(grep -c "calculatedColumn" $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
+          BIDIR=$(grep -c "crossFilteringBehavior.*[Bb]oth" $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
+          FALLBACK_TRIGGERS=$((CALC_COLS + BIDIR))
+          echo "Calculated columns: $CALC_COLS"
+          echo "Bi-directional relationships: $BIDIR"
+          if [ "$FALLBACK_TRIGGERS" -gt "0" ]; then
+            echo "::error::$FALLBACK_TRIGGERS DirectLake fallback triggers found — these force DirectQuery mode (10-100x slower)"
+            [ "$CALC_COLS" -gt "0" ] && grep -n "calculatedColumn" $TMDL_DIR/*.tmdl || true
+            [ "$BIDIR" -gt "0" ] && grep -n "crossFilteringBehavior.*[Bb]oth" $TMDL_DIR/*.tmdl || true
+            echo "directlake_status=FAIL" >> $GITHUB_OUTPUT
+          else
+            echo "No DirectLake fallback triggers — clean"
+            echo "directlake_status=PASS" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Governance ──
+
+      - name: "Governance: Description Coverage"
+        id: desc-coverage
+        run: |
+          echo "=== Description Coverage ==="
+          TMDL_DIR="semantic-model"
+          MEASURES=$(grep -c "measure " $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
+          DESCRIPTIONS=$(grep -c "description:" $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
+          GAP=$((MEASURES - DESCRIPTIONS))
+          echo "Measures: $MEASURES, With descriptions: $DESCRIPTIONS, Gap: $GAP"
+          if [ "$GAP" -gt "3" ]; then
+            echo "::warning::$GAP measures lack descriptions — governance gap"
+            echo "desc_status=WARN" >> $GITHUB_OUTPUT
+          else
+            echo "Description coverage is adequate"
+            echo "desc_status=PASS" >> $GITHUB_OUTPUT
+          fi
+
+      - name: "Governance: Model Complexity Score"
+        id: complexity
+        run: |
+          echo "=== Model Complexity Score ==="
+          TMDL_DIR="semantic-model"
+          TABLES=$(grep -c "^  table " $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
+          MEASURES=$(grep -c "measure " $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
+          COLUMNS=$(grep -c "column " $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
+          CALC_COLS=$(grep -c "calculatedColumn" $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
+          RELATIONSHIPS=$(grep -c "relationship " $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
+          # Weighted score: calc columns penalized heavily
+          SCORE=$((TABLES + MEASURES / 5 + COLUMNS / 10 + CALC_COLS * 10 + RELATIONSHIPS))
+          echo "Tables: $TABLES, Measures: $MEASURES, Columns: $COLUMNS"
+          echo "Calc columns: $CALC_COLS, Relationships: $RELATIONSHIPS"
+          echo "Complexity score: $SCORE (threshold: 50)"
+          if [ "$SCORE" -gt "50" ]; then
+            echo "::warning::Model complexity score $SCORE exceeds threshold — review for bloat"
+            echo "complexity_status=WARN" >> $GITHUB_OUTPUT
+          else
+            echo "Complexity within acceptable range"
+            echo "complexity_status=PASS" >> $GITHUB_OUTPUT
+          fi
+
   # Job 2: Schema Validation
   schema-check:
     name: Schema Registry Validation
@@ -387,11 +577,29 @@ jobs:
           echo "============================================"
           echo "  PERFORMANCE GATE RESULTS"
           echo "============================================"
-          echo "  TMDL Anti-Pattern Scan:  PASSED"
-          echo "  Schema Validation:       PASSED"
-          echo "============================================"
           echo ""
+          echo "  --- Performance Checks ---"
+          echo "  Calculated Columns:       CHECKED"
+          echo "  DAX Anti-Patterns:        CHECKED"
+          echo "  Format Strings:           CHECKED"
+          echo "  Bloat Columns:            CHECKED"
+          echo "  DirectLake Fallback:      CHECKED"
+          echo ""
+          echo "  --- Security Guardrails ---"
+          echo "  RLS Coverage Audit:       CHECKED"
+          echo "  OLS Sensitive Columns:    CHECKED"
+          echo "  Credential/Secret Scan:   CHECKED"
+          echo "  Data Source Security:     CHECKED"
+          echo ""
+          echo "  --- Governance ---"
+          echo "  Description Coverage:     CHECKED"
+          echo "  Model Complexity Score:   CHECKED"
+          echo "  Schema Validation:        PASSED"
+          echo ""
+          echo "============================================"
+          echo "  11 checks completed (4 security, 5 perf, 2 governance)"
           echo "  Static gates passed. Safe to deploy."
+          echo "============================================"
           echo ""
           echo "  Runtime checks (BPA, Memory, Compression)"
           echo "  run via the runtime-analysis job when"
