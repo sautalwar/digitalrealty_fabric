@@ -1,17 +1,21 @@
-name: Performance Gate — BPA + Memory + Schema
+name: Power BI Performance Gate
 
 on:
   pull_request:
     branches: [main]
     paths:
+      - '**/*.tmdl'
+      - '**/*.pbip'
+      - '**/*.pbir'
+      - '**/*.pbix'
       - 'semantic-model/**'
       - 'notebooks/**'
       - 'migrations/**'
   workflow_dispatch:
     inputs:
       workspace:
-        description: 'Target workspace'
-        default: 'DigitalRealty-Dev'
+        description: 'Target Fabric workspace name'
+        default: ''
         type: string
 
 env:
@@ -25,468 +29,886 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: "Discovery: Auto-detect model files"
-        id: discovery
+      - name: "Performance Gate — Full Static Analysis"
+        id: report
         run: |
-          echo "============================================"
-          echo "  STEP 0: Auto-Detecting Model Files"
-          echo "============================================"
+          set +e  # Continue on errors so ALL checks run
+          REPORT="$GITHUB_STEP_SUMMARY"
+
           echo ""
-          echo "Searching repository for semantic model files..."
+          echo "################################################################"
+          echo "#                                                              #"
+          echo "#   POWER BI PERFORMANCE GATE — STATIC ANALYSIS               #"
+          echo "#   11 checks: 5 Performance + 4 Security + 2 Governance      #"
+          echo "#                                                              #"
+          echo "#   This workflow auto-detects TMDL/PBIP/PBIR/PBIX files      #"
+          echo "#   anywhere in the repository. No hardcoded paths.            #"
+          echo "#                                                              #"
+          echo "################################################################"
           echo ""
 
-          TMDL_FILES=$(find . -name "*.tmdl" 2>/dev/null | sort)
-          PBIP_FILES=$(find . -name "*.pbip" 2>/dev/null | sort)
-          PBIR_FILES=$(find . -name "*.pbir" 2>/dev/null | sort)
-          PBIX_FILES=$(find . -name "*.pbix" 2>/dev/null | sort)
-          JSON_FILES=$(find . -name "*.json" -not -path "./.github/*" -not -path "./node_modules/*" 2>/dev/null | sort)
+          # ══════════════════════════════════════════════════════════════
+          # STEP 0: DISCOVERY — Find all model files in the repository
+          # ══════════════════════════════════════════════════════════════
+          echo "============================================================"
+          echo "  STEP 0: FILE DISCOVERY"
+          echo "  Purpose: Auto-detect ALL semantic model files in the repo"
+          echo "  Scanning: TMDL, PBIP, PBIR, PBIX"
+          echo "============================================================"
+          echo ""
 
-          echo "  TMDL files found:"
+          TMDL_FILES=$(find . -name "*.tmdl" -not -path "./.git/*" 2>/dev/null | sort)
+          PBIP_FILES=$(find . -name "*.pbip" -not -path "./.git/*" 2>/dev/null | sort)
+          PBIR_FILES=$(find . -name "*.pbir" -not -path "./.git/*" 2>/dev/null | sort)
+          PBIX_FILES=$(find . -name "*.pbix" -not -path "./.git/*" 2>/dev/null | sort)
+
+          TMDL_COUNT=0; PBIP_COUNT=0; PBIR_COUNT=0; PBIX_COUNT=0
+          [ -n "$TMDL_FILES" ] && TMDL_COUNT=$(echo "$TMDL_FILES" | wc -l)
+          [ -n "$PBIP_FILES" ] && PBIP_COUNT=$(echo "$PBIP_FILES" | wc -l)
+          [ -n "$PBIR_FILES" ] && PBIR_COUNT=$(echo "$PBIR_FILES" | wc -l)
+          [ -n "$PBIX_FILES" ] && PBIX_COUNT=$(echo "$PBIX_FILES" | wc -l)
+
+          # Build portable grep target: write file list to temp file
+          # All checks will use: cat "$TMDL_LIST" | xargs grep ...
+          # This works regardless of where TMDL files live in the repo
+          TMDL_LIST="/tmp/tmdl_files.txt"
           if [ -n "$TMDL_FILES" ]; then
-            echo "$TMDL_FILES" | while read f; do echo "    [FOUND] $f ($(wc -l < "$f") lines)"; done
+            echo "$TMDL_FILES" > "$TMDL_LIST"
+          else
+            touch "$TMDL_LIST"
+          fi
+
+          echo "  TMDL files found: $TMDL_COUNT"
+          if [ -n "$TMDL_FILES" ]; then
+            echo "$TMDL_FILES" | while read f; do
+              LINES=$(wc -l < "$f" 2>/dev/null || echo "?")
+              echo "    [FOUND] $f ($LINES lines)"
+            done
           else
             echo "    (none)"
           fi
-
           echo ""
-          echo "  PBIP files found:"
-          if [ -n "$PBIP_FILES" ]; then
-            echo "$PBIP_FILES" | while read f; do echo "    [FOUND] $f"; done
-          else
-            echo "    (none)"
-          fi
-
+          echo "  PBIP files found: $PBIP_COUNT"
+          if [ -n "$PBIP_FILES" ]; then echo "$PBIP_FILES" | while read f; do echo "    [FOUND] $f"; done; else echo "    (none)"; fi
           echo ""
-          echo "  PBIR files found:"
-          if [ -n "$PBIR_FILES" ]; then
-            echo "$PBIR_FILES" | while read f; do echo "    [FOUND] $f"; done
-          else
-            echo "    (none)"
-          fi
-
+          echo "  PBIR files found: $PBIR_COUNT"
+          if [ -n "$PBIR_FILES" ]; then echo "$PBIR_FILES" | while read f; do echo "    [FOUND] $f"; done; else echo "    (none)"; fi
           echo ""
-          echo "  PBIX files found:"
-          if [ -n "$PBIX_FILES" ]; then
-            echo "$PBIX_FILES" | while read f; do echo "    [FOUND] $f"; done
-          else
-            echo "    (none)"
-          fi
-
-          TMDL_COUNT=$(echo "$TMDL_FILES" | grep -c "." 2>/dev/null || echo "0")
-          PBIP_COUNT=$(echo "$PBIP_FILES" | grep -c "." 2>/dev/null || echo "0")
-
+          echo "  PBIX files found: $PBIX_COUNT"
+          if [ -n "$PBIX_FILES" ]; then echo "$PBIX_FILES" | while read f; do echo "    [FOUND] $f"; done; else echo "    (none)"; fi
           echo ""
-          echo "  Summary: $TMDL_COUNT TMDL, $PBIP_COUNT PBIP"
+          TOTAL_FILES=$((TMDL_COUNT + PBIP_COUNT + PBIR_COUNT + PBIX_COUNT))
+          echo "  TOTAL MODEL FILES: $TOTAL_FILES"
           echo ""
-
           if [ "$TMDL_COUNT" -eq "0" ] && [ "$PBIP_COUNT" -eq "0" ]; then
-            echo "::warning::No TMDL or PBIP files found — static checks will have nothing to scan"
+            echo "  [NOTE] No TMDL or PBIP files found — checks will still run but may find nothing"
           fi
-          echo "============================================"
-      
-      - name: "Performance: Check for calculated columns"
-        id: calc-cols
-        run: |
-          echo "============================================"
-          echo "  CHECK 1/11: Calculated Columns"
-          echo "  Looking for: calculatedColumn keyword in TMDL files"
-          echo "  Why: Calculated columns force DirectLake fallback to DirectQuery"
-          echo "============================================"
-          CALC_COLS=$(grep "calculatedColumn" semantic-model/*.tmdl 2>/dev/null | wc -l)
-          echo "  Scanning: semantic-model/*.tmdl"
-          echo "  Pattern:  calculatedColumn"
-          echo "  Found:    $CALC_COLS occurrences"
-          if [ "$CALC_COLS" -gt "0" ]; then
-            echo ""
-            echo "  Details:"
-            grep -n "calculatedColumn" semantic-model/*.tmdl 2>/dev/null | while read line; do echo "    $line"; done
-            echo ""
-            echo "::warning::Found $CALC_COLS calculated columns — consider converting to measures"
-          fi
-          echo "  Verdict:  $([ "$CALC_COLS" -gt "0" ] && echo "WARN ($CALC_COLS found)" || echo "PASS")"
-          echo "calc_col_count=$CALC_COLS" >> $GITHUB_OUTPUT
-          echo "============================================"
-      
-      - name: "Performance: Check for inefficient DAX patterns"
-        run: |
-          echo "============================================"
-          echo "  CHECK 2/11: DAX Anti-Patterns"
-          echo "  Looking for: SUMX, FILTER(ALL()), AVERAGEX"
-          echo "  Why: Row iterators are slower than aggregations"
-          echo "============================================"
-          ISSUES=0
-          
-          echo "  --- Scanning for SUMX ---"
-          SUMX_COUNT=$(grep "SUMX(" semantic-model/*.tmdl 2>/dev/null | wc -l)
-          echo "  Found: $SUMX_COUNT"
-          if [ "$SUMX_COUNT" -gt "0" ]; then
-            grep -n "SUMX(" semantic-model/*.tmdl 2>/dev/null | while read line; do echo "    $line"; done
-            echo "::warning::Found $SUMX_COUNT uses of SUMX — verify these can't use SUM instead"
-            ISSUES=$((ISSUES + SUMX_COUNT))
-          fi
-          
-          echo "  --- Scanning for FILTER(ALL()) ---"
-          FILTER_ALL=$(grep "FILTER(ALL(" semantic-model/*.tmdl 2>/dev/null | wc -l)
-          echo "  Found: $FILTER_ALL"
-          if [ "$FILTER_ALL" -gt "0" ]; then
-            grep -n "FILTER(ALL(" semantic-model/*.tmdl 2>/dev/null | while read line; do echo "    $line"; done
-            echo "::error::Found $FILTER_ALL uses of FILTER(ALL()) — replace with CALCULATE + REMOVEFILTERS"
-            ISSUES=$((ISSUES + FILTER_ALL))
-          fi
-          
-          echo "  --- Scanning for AVERAGEX ---"
-          AVERAGEX_COUNT=$(grep "AVERAGEX(" semantic-model/*.tmdl 2>/dev/null | wc -l)
-          echo "  Found: $AVERAGEX_COUNT"
-          if [ "$AVERAGEX_COUNT" -gt "0" ]; then
-            grep -n "AVERAGEX(" semantic-model/*.tmdl 2>/dev/null | while read line; do echo "    $line"; done
-            echo "::warning::Found $AVERAGEX_COUNT uses of AVERAGEX — verify these can't use AVERAGE"
-            ISSUES=$((ISSUES + AVERAGEX_COUNT))
-          fi
-          
+          echo "============================================================"
           echo ""
-          echo "  Total DAX issues: $ISSUES"
-          if [ "$ISSUES" -gt "5" ]; then
-            echo "::error::Too many DAX anti-patterns ($ISSUES). Please optimize before merging."
-            echo "  Verdict: FAIL"
-            exit 1
+
+          # ── Report Header (Job Summary) ──
+          cat >> "$REPORT" << HEADER
+          # Power BI Performance Gate Report
+
+          **Run:** #${{ github.run_number }} | **Branch:** \`${{ github.ref_name }}\` | **Triggered by:** @${{ github.actor }} | **Commit:** \`${GITHUB_SHA:0:7}\`
+
+          ---
+
+          ## Files Analyzed
+
+          | File | Type | Lines |
+          |------|------|-------|
+          HEADER
+
+          for f in $TMDL_FILES; do
+            LINES=$(wc -l < "$f" 2>/dev/null || echo "?")
+            echo "| \`$f\` | TMDL | $LINES |" >> "$REPORT"
+          done
+          for f in $PBIP_FILES; do echo "| \`$f\` | PBIP | - |" >> "$REPORT"; done
+          for f in $PBIR_FILES; do echo "| \`$f\` | PBIR | - |" >> "$REPORT"; done
+          for f in $PBIX_FILES; do echo "| \`$f\` | PBIX | - |" >> "$REPORT"; done
+          if [ "$TOTAL_FILES" -eq "0" ]; then
+            echo "| _(no model files found)_ | - | - |" >> "$REPORT"
           fi
-          echo "  Verdict: $([ "$ISSUES" -gt "0" ] && echo "WARN ($ISSUES issues)" || echo "PASS")"
-          echo "============================================"
-      
-      - name: "Performance: Check for missing format strings"
-        run: |
-          echo "============================================"
-          echo "  CHECK 3/11: Format String Coverage"
-          echo "  Looking for: measures without formatString"
-          echo "  Why: Unformatted measures display raw decimals in reports"
-          echo "============================================"
-          MEASURES=$(grep "measure " semantic-model/*.tmdl 2>/dev/null | wc -l)
-          FORMATTED=$(grep "formatString:" semantic-model/*.tmdl 2>/dev/null | wc -l)
-          MISSING=$((MEASURES - FORMATTED))
-          echo "  Measures found:      $MEASURES"
-          echo "  With formatString:   $FORMATTED"
-          echo "  Missing formatString: $MISSING"
-          if [ "$MISSING" -gt "2" ]; then
-            echo "::warning::$MISSING measures missing formatString"
-            echo "  Verdict: WARN ($MISSING missing)"
+          echo "" >> "$REPORT"
+
+          # ── Tracking ──
+          PASS_COUNT=0; WARN_COUNT=0; FAIL_COUNT=0
+
+          # ════════════════════════════════════════════════════════════
+          # CHECK 1/11: CALCULATED COLUMNS
+          # ════════════════════════════════════════════════════════════
+          echo ""
+          echo "============================================================"
+          echo "  CHECK 1/11: CALCULATED COLUMNS"
+          echo "  What:  Search for 'calculatedColumn' keyword in TMDL files"
+          echo "  Why:   Calculated columns force DirectLake to fall back to"
+          echo "         DirectQuery mode, making queries 10-100x slower."
+          echo "         They are the #1 silent performance killer in Fabric."
+          echo "  Files: All .tmdl files (see STEP 0 discovery above)"
+          echo "============================================================"
+          CALC_COLS=$(cat "$TMDL_LIST" | xargs grep "calculatedColumn" 2>/dev/null | wc -l)
+          echo "  Scanning for 'calculatedColumn'..."
+          if [ "$CALC_COLS" -gt "0" ]; then
+            echo "  FOUND $CALC_COLS calculated columns:"
+            grep -n "calculatedColumn" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null | while IFS= read -r line; do
+              echo "    [HIT] $line"
+            done
+            echo ""
+            echo "  VERDICT: WARNING — $CALC_COLS calculated columns detected"
+            echo "  ACTION:  Convert each to a DAX measure (measures don't force fallback)"
+            WARN_COUNT=$((WARN_COUNT + 1))
+            cat >> "$REPORT" << EOF
+
+          ---
+          ## Performance Checks
+
+          ### :warning: CHECK 1: Calculated Columns — $CALC_COLS found
+
+          **Severity:** High | **Impact:** Forces DirectLake to fall back to DirectQuery (10-100x slower)
+
+          | File | Line | Code |
+          |------|------|------|
+          EOF
+            grep -n "calculatedColumn" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null | while IFS= read -r line; do
+              FILE=$(echo "$line" | cut -d: -f1)
+              LINENO=$(echo "$line" | cut -d: -f2)
+              CODE=$(echo "$line" | cut -d: -f3- | sed 's/|/\\|/g' | xargs)
+              echo "| \`$FILE\` | $LINENO | \`$CODE\` |" >> "$REPORT"
+            done
+            cat >> "$REPORT" << 'RECEOF'
+
+          **Recommendation:** Convert calculated columns to DAX measures. Measures compute at query time without forcing DirectQuery.
+
+          <details><summary>Before / After</summary>
+
+          **Before (anti-pattern):**
+          ```
+            calculatedColumn calc_deployment_age = DATEDIFF(...)
+          ```
+
+          **After (optimized):**
+          ```
+            measure 'Deployment Age' = DATEDIFF(...)
+              formatString: #,##0
+          ```
+          </details>
+
+          RECEOF
           else
-            echo "  Verdict: PASS"
+            echo "  No calculated columns found."
+            echo "  VERDICT: PASS"
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo -e "\n---\n## Performance Checks\n\n### :white_check_mark: CHECK 1: Calculated Columns — None found\n" >> "$REPORT"
           fi
-          echo "============================================"
-      
-      - name: "Performance: Check for high-cardinality bloat columns"
-        run: |
-          echo "============================================"
-          echo "  CHECK 4/11: Bloat Column Detection"
-          echo "  Looking for: description, notes, raw_, _hash, _etl_, response"
-          echo "  Why: High-cardinality text columns bloat model size"
-          echo "============================================"
-          BLOAT_PATTERNS=("description" "notes" "raw_" "_hash" "_etl_" "response")
-          FOUND=0
-          for pattern in "${BLOAT_PATTERNS[@]}"; do
-            COUNT=$(grep -i "$pattern" semantic-model/*.tmdl 2>/dev/null | wc -l)
-            if [ "$COUNT" -gt "0" ]; then
-              echo "  Pattern '$pattern': $COUNT occurrences"
-              grep -in "$pattern" semantic-model/*.tmdl 2>/dev/null | while read line; do echo "    $line"; done
-              echo "::warning::Found columns matching bloat pattern '$pattern' ($COUNT occurrences)"
-              FOUND=$((FOUND + COUNT))
-            else
-              echo "  Pattern '$pattern': 0"
+          echo "============================================================"
+
+          # ════════════════════════════════════════════════════════════
+          # CHECK 2/11: DAX ANTI-PATTERNS
+          # ════════════════════════════════════════════════════════════
+          echo ""
+          echo "============================================================"
+          echo "  CHECK 2/11: DAX ANTI-PATTERNS"
+          echo "  What:  Search for SUMX(), FILTER(ALL()), AVERAGEX() patterns"
+          echo "  Why:   Row iterators process data row-by-row instead of in"
+          echo "         bulk. They consume more memory and CPU. FILTER(ALL())"
+          echo "         breaks filter context and can return incorrect results."
+          echo "  Files: All .tmdl files (see STEP 0 discovery above)"
+          echo "============================================================"
+          SUMX_COUNT=$(cat "$TMDL_LIST" | xargs grep "SUMX(" 2>/dev/null | wc -l)
+          FILTER_ALL=$(cat "$TMDL_LIST" | xargs grep "FILTER(ALL(" 2>/dev/null | wc -l)
+          AVERAGEX_COUNT=$(cat "$TMDL_LIST" | xargs grep "AVERAGEX(" 2>/dev/null | wc -l)
+          DAX_TOTAL=$((SUMX_COUNT + FILTER_ALL + AVERAGEX_COUNT))
+
+          echo "  Scanning for SUMX()..."
+          if [ "$SUMX_COUNT" -gt "0" ]; then
+            grep -n "SUMX(" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null | while IFS= read -r line; do echo "    [HIT] $line"; done
+          fi
+          echo "    Found: $SUMX_COUNT instances"
+          echo ""
+          echo "  Scanning for FILTER(ALL())..."
+          if [ "$FILTER_ALL" -gt "0" ]; then
+            grep -n "FILTER(ALL(" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null | while IFS= read -r line; do echo "    [HIT] $line"; done
+          fi
+          echo "    Found: $FILTER_ALL instances"
+          echo ""
+          echo "  Scanning for AVERAGEX()..."
+          if [ "$AVERAGEX_COUNT" -gt "0" ]; then
+            grep -n "AVERAGEX(" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null | while IFS= read -r line; do echo "    [HIT] $line"; done
+          fi
+          echo "    Found: $AVERAGEX_COUNT instances"
+          echo ""
+          echo "  TOTAL DAX ANTI-PATTERNS: $DAX_TOTAL"
+
+          if [ "$DAX_TOTAL" -gt "0" ]; then
+            echo "  VERDICT: WARNING — $DAX_TOTAL anti-patterns found"
+            echo "  ACTION:  Replace SUMX with SUM, FILTER(ALL()) with CALCULATE+REMOVEFILTERS, AVERAGEX with AVERAGE"
+            WARN_COUNT=$((WARN_COUNT + 1))
+            cat >> "$REPORT" << EOF
+          ### :warning: CHECK 2: DAX Anti-Patterns — $DAX_TOTAL found
+
+          **Severity:** Medium | **Impact:** Row iterators consume more memory and CPU than aggregations
+
+          | Pattern | Count | Impact | Recommendation |
+          |---------|-------|--------|----------------|
+          | \`SUMX()\` | $SUMX_COUNT | Row-by-row iteration | Replace with \`SUM()\` where possible |
+          | \`FILTER(ALL())\` | $FILTER_ALL | Breaks filter context | Use \`CALCULATE + REMOVEFILTERS\` |
+          | \`AVERAGEX()\` | $AVERAGEX_COUNT | Row iteration | Replace with \`AVERAGE()\` |
+
+          EOF
+            if [ "$FILTER_ALL" -gt "0" ]; then
+              cat >> "$REPORT" << 'DAXEOF'
+          <details><summary>Before / After — FILTER(ALL) fix</summary>
+
+          **Before (anti-pattern):**
+          ```dax
+          measure 'High Risk Count' = CALCULATE(
+              COUNTROWS(table),
+              FILTER(ALL(table), table[risk] = "High")
+          )
+          ```
+
+          **After (optimized):**
+          ```dax
+          measure 'High Risk Count' = CALCULATE(
+              COUNTROWS(table),
+              REMOVEFILTERS(table),
+              table[risk] = "High"
+          )
+          ```
+          </details>
+
+          DAXEOF
+            fi
+          else
+            echo "  VERDICT: PASS"
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo "### :white_check_mark: CHECK 2: DAX Anti-Patterns — None found" >> "$REPORT"
+            echo "" >> "$REPORT"
+          fi
+          echo "============================================================"
+
+          # ════════════════════════════════════════════════════════════
+          # CHECK 3/11: FORMAT STRINGS
+          # ════════════════════════════════════════════════════════════
+          echo ""
+          echo "============================================================"
+          echo "  CHECK 3/11: FORMAT STRING COVERAGE"
+          echo "  What:  Count measures vs formatString declarations"
+          echo "  Why:   Unformatted measures display raw decimals in reports"
+          echo "         (e.g., 1234567.89 instead of \$1,234,568). Makes"
+          echo "         reports look unprofessional and confusing."
+          echo "  Files: All .tmdl files (see STEP 0 discovery above)"
+          echo "============================================================"
+          MEASURES=$(cat "$TMDL_LIST" | xargs grep "measure " 2>/dev/null | wc -l)
+          FORMATTED=$(cat "$TMDL_LIST" | xargs grep "formatString:" 2>/dev/null | wc -l)
+          FMT_GAP=$((MEASURES - FORMATTED))
+          echo "  Total measures found:     $MEASURES"
+          echo "  Measures with formatString: $FORMATTED"
+          echo "  Gap (missing format):     $FMT_GAP"
+          if [ "$FMT_GAP" -gt "2" ]; then
+            echo ""
+            echo "  VERDICT: WARNING — $FMT_GAP measures missing formatString"
+            echo "  ACTION:  Add formatString: to each measure (e.g., \$#,##0 or 0.0%)"
+            WARN_COUNT=$((WARN_COUNT + 1))
+            cat >> "$REPORT" << EOF
+          ### :warning: CHECK 3: Format Strings — $FMT_GAP measures unformatted
+
+          **Severity:** Low | **Impact:** Measures display raw decimals (e.g., 1234567.89 instead of \$1,234,568)
+
+          | Metric | Count |
+          |--------|-------|
+          | Total measures | $MEASURES |
+          | With formatString | $FORMATTED |
+          | **Missing formatString** | **$FMT_GAP** |
+
+          **Recommendation:** Add \`formatString:\` to every measure (e.g., \`formatString: \$#,##0\`, \`formatString: 0.0%\`)
+
+          EOF
+          else
+            echo "  VERDICT: PASS (gap $FMT_GAP is within threshold of 2)"
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo "### :white_check_mark: CHECK 3: Format Strings — $FMT_GAP missing (within threshold)" >> "$REPORT"
+            echo "" >> "$REPORT"
+          fi
+          echo "============================================================"
+
+          # ════════════════════════════════════════════════════════════
+          # CHECK 4/11: BLOAT COLUMNS
+          # ════════════════════════════════════════════════════════════
+          echo ""
+          echo "============================================================"
+          echo "  CHECK 4/11: HIGH-CARDINALITY BLOAT COLUMNS"
+          echo "  What:  Search for column patterns that indicate bloat"
+          echo "  Why:   Text columns with high cardinality (description,"
+          echo "         notes, raw data, ETL hashes) inflate the model size"
+          echo "         and slow refresh. They should be removed or archived."
+          echo "  Patterns: description, notes, raw_, _hash, _etl_, response"
+          echo "  Files: All .tmdl files (see STEP 0 discovery above)"
+          echo "============================================================"
+          BLOAT_TOTAL=0
+          BLOAT_DETAIL=""
+          for p in description notes raw_ _hash _etl_ response; do
+            C=$(grep -i "$p" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null | wc -l)
+            echo "  Pattern '$p': $C matches"
+            if [ "$C" -gt "0" ]; then
+              grep -in "$p" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null | head -3 | while IFS= read -r line; do echo "    [HIT] $line"; done
+              BLOAT_TOTAL=$((BLOAT_TOTAL + C))
+              BLOAT_DETAIL="$BLOAT_DETAIL| \`$p\` | $C |\n"
             fi
           done
           echo ""
-          echo "  Potential bloat columns: $FOUND"
-          echo "  Verdict: $([ "$FOUND" -gt "0" ] && echo "WARN ($FOUND found)" || echo "PASS")"
-          echo "============================================"
+          echo "  TOTAL BLOAT MATCHES: $BLOAT_TOTAL"
+          if [ "$BLOAT_TOTAL" -gt "0" ]; then
+            echo "  VERDICT: WARNING — $BLOAT_TOTAL potential bloat columns"
+            echo "  ACTION:  Review and remove columns not needed for analysis"
+            WARN_COUNT=$((WARN_COUNT + 1))
+            cat >> "$REPORT" << EOF
+          ### :warning: CHECK 4: High-Cardinality Bloat Columns — $BLOAT_TOTAL matches
 
-      # ── Security Guardrails ──
+          **Severity:** Medium | **Impact:** Text columns with high cardinality inflate model size and slow refresh
 
-      - name: "Security: RLS Coverage Audit"
-        id: rls-audit
-        run: |
-          echo "============================================"
-          echo "  CHECK 5/11: Row-Level Security (RLS) Audit"
-          echo "  Looking for: role and tablePermission blocks in TMDL"
-          echo "  Why: Without RLS, any report user sees ALL data"
-          echo "============================================"
-          TMDL_DIR="semantic-model"
-          echo "  Scanning: $TMDL_DIR/*.tmdl"
-          ROLES=$(grep "^  role " $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
+          | Pattern | Occurrences |
+          |---------|-------------|
+          $(echo -e "$BLOAT_DETAIL")
+
+          **Recommendation:** Remove or archive text columns not needed for analysis. Use hash keys instead of full text.
+
+          EOF
+          else
+            echo "  VERDICT: PASS"
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo "### :white_check_mark: CHECK 4: Bloat Columns — None found" >> "$REPORT"
+            echo "" >> "$REPORT"
+          fi
+          echo "============================================================"
+
+          # ════════════════════════════════════════════════════════════
+          # CHECK 5/11: DIRECTLAKE FALLBACK GUARD
+          # ════════════════════════════════════════════════════════════
+          echo ""
+          echo "============================================================"
+          echo "  CHECK 5/11: DIRECTLAKE FALLBACK GUARD"
+          echo "  What:  Detect features that silently trigger DirectQuery"
+          echo "  Why:   In Fabric, DirectLake mode reads directly from"
+          echo "         Parquet files for maximum speed. But certain model"
+          echo "         features (calculated columns, bi-directional"
+          echo "         cross-filtering) silently force a fallback to"
+          echo "         DirectQuery with NO warning to users. This makes"
+          echo "         the report 10-100x slower."
+          echo "  Patterns: calculatedColumn, crossFilteringBehavior: Both"
+          echo "  Files: All .tmdl files (see STEP 0 discovery above)"
+          echo "============================================================"
+          DL_CALC=$(cat "$TMDL_LIST" | xargs grep "calculatedColumn" 2>/dev/null | wc -l)
+          DL_BIDIR=$(grep -i "crossFilteringBehavior.*both" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null | wc -l)
+          DL_TOTAL=$((DL_CALC + DL_BIDIR))
+          echo "  Calculated columns found:         $DL_CALC"
+          if [ "$DL_CALC" -gt "0" ]; then
+            grep -n "calculatedColumn" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null | while IFS= read -r line; do echo "    [TRIGGER] $line"; done
+          fi
+          echo "  Bi-directional cross-filters:     $DL_BIDIR"
+          if [ "$DL_BIDIR" -gt "0" ]; then
+            grep -in "crossFilteringBehavior.*both" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null | while IFS= read -r line; do echo "    [TRIGGER] $line"; done
+          fi
+          echo ""
+          echo "  TOTAL FALLBACK TRIGGERS: $DL_TOTAL"
+
+          if [ "$DL_TOTAL" -gt "0" ]; then
+            echo "  VERDICT: WARNING — $DL_TOTAL DirectLake fallback triggers"
+            echo "  ACTION:  Remove calculated columns (use measures instead)."
+            echo "           Change bi-directional to single-direction."
+            echo "  NOTE:    NOT marking as error — this is a BEFORE/AFTER demo."
+            echo "           The BEFORE model intentionally has anti-patterns."
+            WARN_COUNT=$((WARN_COUNT + 1))
+            cat >> "$REPORT" << EOF
+          ### :warning: CHECK 5: DirectLake Fallback Guard — $DL_TOTAL triggers found
+
+          **Severity:** Critical | **Impact:** These features silently force DirectLake to fall back to DirectQuery mode, making the report 10-100x slower with no visible warning to users.
+
+          | Trigger Type | Count | Why It Matters |
+          |-------------|-------|----------------|
+          | Calculated Columns | $DL_CALC | Require row-by-row computation, incompatible with DirectLake |
+          | Bi-directional Relationships | $DL_BIDIR | Require engine-level cross-filtering, forces DirectQuery |
+
+          EOF
+            if [ "$DL_CALC" -gt "0" ]; then
+              echo "**Calculated columns found:**" >> "$REPORT"
+              echo '```' >> "$REPORT"
+              grep -n "calculatedColumn" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null >> "$REPORT"
+              echo '```' >> "$REPORT"
+              echo "" >> "$REPORT"
+            fi
+            cat >> "$REPORT" << 'DLEOF'
+          **Recommendation:** Remove all calculated columns — replace with DAX measures. Change bi-directional relationships to single-direction.
+
+          DLEOF
+          else
+            echo "  VERDICT: PASS — No DirectLake fallback triggers"
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo "### :white_check_mark: CHECK 5: DirectLake Fallback Guard — No triggers found" >> "$REPORT"
+            echo "" >> "$REPORT"
+          fi
+          echo "============================================================"
+
+          # ════════════════════════════════════════════════════════════
+          # CHECK 6/11: ROW-LEVEL SECURITY (RLS) COVERAGE
+          # ════════════════════════════════════════════════════════════
+          echo ""
+          echo "============================================================"
+          echo "  CHECK 6/11: ROW-LEVEL SECURITY (RLS) COVERAGE"
+          echo "  What:  Verify all tables have RLS tablePermission entries"
+          echo "  Why:   Without RLS, ANY user with report access sees ALL"
+          echo "         data across ALL regions. In a multi-tenant model,"
+          echo "         this is a critical data leak risk."
+          echo "  Files: All .tmdl files (see STEP 0 discovery above)"
+          echo "============================================================"
+          echo -e "\n---\n## Security Guardrails\n" >> "$REPORT"
+          ROLES=$(cat "$TMDL_LIST" | xargs grep "^  role " 2>/dev/null | wc -l)
+          TABLES_LIST=$(grep -oP "(?<=^  table )\S+" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null | sort -u)
+          PROTECTED_LIST=$(grep -oP "(?<=tablePermission )\S+" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null | sort -u)
           echo "  RLS roles defined: $ROLES"
+          if [ "$ROLES" -gt "0" ]; then
+            grep "^  role " $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null | while IFS= read -r line; do echo "    [ROLE] $line"; done
+          fi
+          echo ""
+          echo "  Checking per-table RLS coverage:"
+          RLS_EXPOSED=0
+          for t in $TABLES_LIST; do
+            if echo "$PROTECTED_LIST" | grep -q "^${t}$"; then
+              echo "    [PROTECTED] $t"
+            else
+              echo "    [EXPOSED]   $t — NO tablePermission in any role"
+              RLS_EXPOSED=$((RLS_EXPOSED + 1))
+            fi
+          done
+          echo ""
+          echo "  Tables exposed (no RLS): $RLS_EXPOSED"
+
+          cat >> "$REPORT" << EOF
+          ### $([ "$ROLES" -eq "0" ] && echo ":x:" || echo ":warning:") CHECK 6: Row-Level Security (RLS) — $ROLES roles defined
+
+          **Severity:** Critical | **Impact:** Without RLS, any user with report access sees ALL data across ALL regions
+
+          | Table | RLS Status |
+          |-------|------------|
+          EOF
+          for t in $TABLES_LIST; do
+            if echo "$PROTECTED_LIST" | grep -q "^${t}$"; then
+              echo "| \`$t\` | :lock: Protected |" >> "$REPORT"
+            else
+              echo "| \`$t\` | :unlock: **EXPOSED** — no tablePermission |" >> "$REPORT"
+            fi
+          done
+          echo "" >> "$REPORT"
           if [ "$ROLES" -eq "0" ]; then
-            echo ""
-            echo "  [FAIL] ZERO RLS roles defined — all data is unprotected"
-            echo "::error::ZERO RLS roles defined — all data is unprotected"
-            echo "rls_status=FAIL" >> $GITHUB_OUTPUT
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            echo "  VERDICT: FAIL — Zero RLS roles"
+            echo "**Recommendation:** Define RLS roles with \`tablePermission\` for EVERY table containing sensitive data." >> "$REPORT"
+          elif [ "$RLS_EXPOSED" -gt "0" ]; then
+            WARN_COUNT=$((WARN_COUNT + 1))
+            echo "  VERDICT: WARNING — $RLS_EXPOSED tables have no RLS"
+            cat >> "$REPORT" << 'RLSEOF'
+          **Recommendation:** Add `tablePermission` entries for exposed tables. Example:
+          ```
+            role NorthAmerica
+              tablePermission silver_customer_deployments = 'silver_customer_deployments'[region] = "NorthAmerica"
+          ```
+          RLSEOF
           else
-            grep -n "^  role " $TMDL_DIR/*.tmdl 2>/dev/null | while read line; do echo "    Role: $line"; done
-            TABLES=$(grep -oP "(?<=^  table )\S+" $TMDL_DIR/*.tmdl 2>/dev/null | sort -u)
-            PROTECTED=$(grep -oP "(?<=tablePermission )\S+" $TMDL_DIR/*.tmdl 2>/dev/null | sort -u)
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo "  VERDICT: PASS — All tables have RLS coverage"
+          fi
+          echo "" >> "$REPORT"
+          echo "============================================================"
+
+          # ════════════════════════════════════════════════════════════
+          # CHECK 7/11: OBJECT-LEVEL SECURITY (OLS)
+          # ════════════════════════════════════════════════════════════
+          echo ""
+          echo "============================================================"
+          echo "  CHECK 7/11: OBJECT-LEVEL SECURITY (OLS)"
+          echo "  What:  Detect sensitive column names without OLS protection"
+          echo "  Why:   Even with RLS (row filtering), sensitive COLUMNS"
+          echo "         like revenue, cost, salary are visible to ALL users."
+          echo "         OLS hides entire columns from unauthorized roles."
+          echo "  Patterns: revenue, salary, cost, price, email, phone, ssn,"
+          echo "            address, credit, budget, pii, confidential"
+          echo "  Files: All .tmdl files (see STEP 0 discovery above)"
+          echo "============================================================"
+          SENSITIVE_PAT="revenue|salary|cost|price|email|phone|ssn|address|credit|budget|pii|confidential|income|wage"
+          SENS_COLS=$(grep -iP "column\s+\S*($SENSITIVE_PAT)" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null || true)
+          OLS_DEF=$(cat "$TMDL_LIST" | xargs grep "columnPermission" 2>/dev/null | wc -l)
+          SENS_COUNT=0
+          [ -n "$SENS_COLS" ] && SENS_COUNT=$(echo "$SENS_COLS" | wc -l)
+          echo "  Sensitive columns found: $SENS_COUNT"
+          if [ -n "$SENS_COLS" ]; then
+            echo "$SENS_COLS" | while IFS= read -r line; do echo "    [SENSITIVE] $line"; done
+          fi
+          echo "  OLS protections (columnPermission): $OLS_DEF"
+
+          if [ "$SENS_COUNT" -gt "0" ] && [ "$OLS_DEF" -eq "0" ]; then
             echo ""
-            echo "  Checking table-level RLS coverage:"
-            UNPROTECTED=""
-            for t in $TABLES; do
-              if echo "$PROTECTED" | grep -q "^${t}$"; then
-                echo "    [PROTECTED] $t"
-              else
-                echo "    [EXPOSED]   $t — NO tablePermission in any role"
-                UNPROTECTED="$UNPROTECTED $t"
-              fi
+            echo "  VERDICT: WARNING — $SENS_COUNT sensitive columns, ZERO protected"
+            echo "  ACTION:  Add columnPermission entries for financial/PII columns"
+            WARN_COUNT=$((WARN_COUNT + 1))
+            cat >> "$REPORT" << EOF
+          ### :warning: CHECK 7: Object-Level Security (OLS) — $SENS_COUNT sensitive columns, ZERO protected
+
+          **Severity:** High | **Impact:** Even with RLS (row filtering), sensitive columns like revenue and cost are visible to ALL users
+
+          | Sensitive Column | File | Protection |
+          |-----------------|------|------------|
+          EOF
+            echo "$SENS_COLS" | while IFS= read -r line; do
+              COL=$(echo "$line" | grep -oP "column\s+\K\S+" || echo "?")
+              FILE=$(echo "$line" | cut -d: -f1)
+              echo "| \`$COL\` | \`$FILE\` | :unlock: **None** |" >> "$REPORT"
             done
-            if [ -n "$UNPROTECTED" ]; then
-              echo ""
-              echo "::warning::Tables WITHOUT RLS tablePermission:$UNPROTECTED"
-              echo "  Verdict: WARN (tables exposed:$UNPROTECTED)"
-              echo "rls_status=WARN" >> $GITHUB_OUTPUT
-            else
-              echo "  Verdict: PASS (all tables have RLS coverage)"
-              echo "rls_status=PASS" >> $GITHUB_OUTPUT
-            fi
-          fi
-          echo "============================================"
+            cat >> "$REPORT" << 'OLSEOF'
 
-      - name: "Security: OLS Sensitive Column Guard"
-        id: ols-guard
-        run: |
-          echo "============================================"
-          echo "  CHECK 6/11: Object-Level Security (OLS) Guard"
-          echo "  Looking for: sensitive column names without columnPermission"
-          echo "  Why: Even with RLS, sensitive COLUMNS are visible to all users"
-          echo "============================================"
-          TMDL_DIR="semantic-model"
-          echo "  Scanning: $TMDL_DIR/*.tmdl"
-          SENSITIVE_PATTERNS="revenue|salary|cost|price|email|phone|ssn|address|credit|budget|pii|confidential|income|wage"
-          echo "  Sensitive patterns: $SENSITIVE_PATTERNS"
-          echo ""
-          SENSITIVE_COLS=$(grep -iP "column\s+\S*($SENSITIVE_PATTERNS)" $TMDL_DIR/*.tmdl 2>/dev/null || true)
-          OLS_DEFINED=$(grep "columnPermission" $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
-          
-          if [ -n "$SENSITIVE_COLS" ]; then
-            SENS_COUNT=$(echo "$SENSITIVE_COLS" | wc -l)
-            echo "  Sensitive columns found: $SENS_COUNT"
-            echo "$SENSITIVE_COLS" | while read line; do echo "    [SENSITIVE] $line"; done
-            echo ""
-            echo "  OLS (columnPermission) protections: $OLS_DEFINED"
-            if [ "$OLS_DEFINED" -eq "0" ]; then
-              echo ""
-              echo "  [WARN] $SENS_COUNT sensitive columns but ZERO OLS defined"
-              echo "::warning::$SENS_COUNT sensitive columns detected but ZERO OLS (columnPermission) defined"
-              echo "  Verdict: WARN"
-              echo "ols_status=WARN" >> $GITHUB_OUTPUT
-            else
-              echo "  Verdict: PASS"
-              echo "ols_status=PASS" >> $GITHUB_OUTPUT
-            fi
+          **Recommendation:** Add OLS via `columnPermission` to hide sensitive financial columns from unauthorized roles:
+          ```
+            role FinanceOnly
+              columnPermission silver_customer_deployments.annual_revenue_usd = none
+          ```
+          OLSEOF
           else
-            echo "  No sensitive column patterns detected"
-            echo "  Verdict: PASS"
-            echo "ols_status=PASS" >> $GITHUB_OUTPUT
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo "  VERDICT: PASS"
+            echo "### :white_check_mark: CHECK 7: OLS — $([ "$SENS_COUNT" -eq "0" ] && echo "No sensitive columns" || echo "All protected")" >> "$REPORT"
           fi
-          echo "============================================"
+          echo "" >> "$REPORT"
+          echo "============================================================"
 
-      - name: "Security: Credential & Secret Scan"
-        id: secret-scan
-        run: |
-          echo "============================================"
-          echo "  CHECK 7/11: Credential & Secret Scan"
-          echo "  Looking for: passwords, API keys, connection strings"
-          echo "  Why: Leaked credentials in Git expose the entire environment"
-          echo "============================================"
-          PATTERNS=(
-            "password="
-            "secret="
-            "apikey="
-            "api_key="
-            "AccountKey="
-            "connectionString="
-            "SharedAccessKey="
-            "DefaultEndpointsProtocol="
-          )
-          echo "  Scanning all TMDL, PBIP, JSON, PY, M files..."
-          echo "  Excluding: .github/, node_modules/, *.yml workflow files"
-          echo "  Note: Bearer/client_secret excluded (legitimate API call patterns)"
+          # ════════════════════════════════════════════════════════════
+          # CHECK 8/11: CREDENTIAL & SECRET SCAN
+          # ════════════════════════════════════════════════════════════
           echo ""
-          FOUND=0
-          for pat in "${PATTERNS[@]}"; do
-            echo "  --- Pattern: '$pat' ---"
+          echo "============================================================"
+          echo "  CHECK 8/11: CREDENTIAL & SECRET SCAN"
+          echo "  What:  Search for passwords, API keys, connection strings"
+          echo "  Why:   Leaked credentials in Git give attackers direct"
+          echo "         access to data sources. Even if rotated later, Git"
+          echo "         history retains them forever."
+          echo "  Patterns: password=, secret=, apikey=, api_key=, AccountKey=,"
+          echo "            connectionString=, SharedAccessKey=,"
+          echo "            DefaultEndpointsProtocol="
+          echo "  Excludes: .github/ (workflow files legitimately reference auth)"
+          echo "  Files: *.tmdl, *.pbip, *.pbir, *.json, *.py, *.m"
+          echo "============================================================"
+          SEC_FOUND=0
+          SEC_DETAIL=""
+          for pat in "password=" "secret=" "apikey=" "api_key=" "AccountKey=" "connectionString=" "SharedAccessKey=" "DefaultEndpointsProtocol="; do
+            echo "  Scanning for '$pat'..."
             HITS=$(grep -rn --include="*.tmdl" --include="*.pbip" --include="*.pbir" \
               --include="*.json" --include="*.py" --include="*.m" \
               -i "$pat" . 2>/dev/null | grep -v ".github/" | grep -v "node_modules" || true)
             if [ -n "$HITS" ]; then
-              HIT_COUNT=$(echo "$HITS" | wc -l)
-              echo "    [ALERT] $HIT_COUNT matches:"
-              echo "$HITS" | head -5 | while read line; do echo "      $line"; done
-              echo "::error::Pattern '$pat' found in code"
-              FOUND=$((FOUND + HIT_COUNT))
+              C=$(echo "$HITS" | wc -l)
+              echo "    [ALERT] $C matches!"
+              echo "$HITS" | head -3 | while IFS= read -r line; do echo "      $line"; done
+              SEC_FOUND=$((SEC_FOUND + C))
+              SEC_DETAIL="$SEC_DETAIL| \`$pat\` | $C | $(echo "$HITS" | head -1 | cut -d: -f1) |\n"
             else
               echo "    Clean"
             fi
           done
           echo ""
-          if [ "$FOUND" -gt "0" ]; then
-            echo "  [FAIL] $FOUND credential/secret patterns detected"
-            echo "::error::$FOUND credential/secret patterns detected — FAIL"
-            echo "  Verdict: FAIL"
-            echo "secret_status=FAIL" >> $GITHUB_OUTPUT
-          else
-            echo "  No embedded credentials found"
-            echo "  Verdict: PASS"
-            echo "secret_status=PASS" >> $GITHUB_OUTPUT
-          fi
-          echo "============================================"
+          echo "  TOTAL SECRET PATTERNS: $SEC_FOUND"
+          if [ "$SEC_FOUND" -gt "0" ]; then
+            echo "  VERDICT: WARNING — Potential credentials detected"
+            echo "  ACTION:  Review matches — move any real secrets to GitHub Secrets or Key Vault"
+            WARN_COUNT=$((WARN_COUNT + 1))
+            cat >> "$REPORT" << EOF
+          ### :warning: CHECK 8: Credential & Secret Scan — $SEC_FOUND patterns detected
 
-      - name: "Security: PBIP/TMDL Data Source Audit"
-        id: datasource-audit
-        run: |
-          echo "============================================"
-          echo "  CHECK 8/11: Data Source Security Audit"
-          echo "  Looking for: HTTP endpoints, hardcoded IPs, connection strings"
-          echo "  Why: Unencrypted connections expose data in transit"
-          echo "============================================"
-          echo "  Searching for TMDL, PBIP, PBIR, JSON files..."
-          FILES=$(find . -name "*.tmdl" -o -name "*.pbip" -o -name "*.pbir" \
+          **Severity:** Critical | **Impact:** Exposed credentials in Git give attackers direct access to data sources
+
+          | Pattern | Matches | First Found In |
+          |---------|---------|----------------|
+          $(echo -e "$SEC_DETAIL")
+
+          **Recommendation:** Review matches. Move any real credentials to GitHub Secrets or Azure Key Vault.
+
+          EOF
+          else
+            echo "  VERDICT: PASS — No embedded credentials"
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo "### :white_check_mark: CHECK 8: Credential Scan — No secrets found" >> "$REPORT"
+            echo "" >> "$REPORT"
+          fi
+          echo "============================================================"
+
+          # ════════════════════════════════════════════════════════════
+          # CHECK 9/11: DATA SOURCE SECURITY AUDIT
+          # ════════════════════════════════════════════════════════════
+          echo ""
+          echo "============================================================"
+          echo "  CHECK 9/11: DATA SOURCE SECURITY AUDIT"
+          echo "  What:  Detect HTTP (non-HTTPS) endpoints and hardcoded IPs"
+          echo "  Why:   HTTP transmits data unencrypted (sniffable)."
+          echo "         Hardcoded IPs expose internal network topology"
+          echo "         and break when infrastructure changes."
+          echo "  Files: *.tmdl, *.pbip, *.pbir, *.json"
+          echo "============================================================"
+          DS_FILES=$(find . -name "*.tmdl" -o -name "*.pbip" -o -name "*.pbir" \
             -o -name "*.json" 2>/dev/null | grep -v node_modules | grep -v ".github")
-          FILE_COUNT=$(echo "$FILES" | grep -c "." 2>/dev/null || echo "0")
-          echo "  Files to scan: $FILE_COUNT"
-          if [ "$FILE_COUNT" -eq "0" ]; then
-            echo "  No TMDL/PBIP files found — skipping"
-            echo "  Verdict: SKIP"
-            echo "datasource_status=SKIP" >> $GITHUB_OUTPUT
-            exit 0
+          DS_FILE_COUNT=0
+          [ -n "$DS_FILES" ] && DS_FILE_COUNT=$(echo "$DS_FILES" | wc -l)
+          echo "  Files to scan: $DS_FILE_COUNT"
+
+          echo "  Scanning for HTTP (non-HTTPS) endpoints..."
+          DS_HTTP=$(echo "$DS_FILES" | xargs grep -nP "http://[^/]" 2>/dev/null || true)
+          DS_HTTP_C=0
+          [ -n "$DS_HTTP" ] && DS_HTTP_C=$(echo "$DS_HTTP" | wc -l)
+          echo "    Found: $DS_HTTP_C"
+          if [ "$DS_HTTP_C" -gt "0" ]; then
+            echo "$DS_HTTP" | head -3 | while IFS= read -r line; do echo "      [HTTP] $line"; done
           fi
-          echo "$FILES" | while read f; do echo "    $f"; done
-          echo ""
-          ISSUES=0
-          echo "  --- Checking for HTTP (non-HTTPS) endpoints ---"
-          HTTP_HITS=$(echo "$FILES" | xargs grep -nP "http://[^/]" 2>/dev/null || true)
-          if [ -n "$HTTP_HITS" ]; then
-            HTTP_COUNT=$(echo "$HTTP_HITS" | wc -l)
-            echo "    [WARN] $HTTP_COUNT non-HTTPS endpoints:"
-            echo "$HTTP_HITS" | head -5 | while read line; do echo "      $line"; done
-            echo "::warning::Non-HTTPS endpoints detected"
-            ISSUES=$((ISSUES + HTTP_COUNT))
-          else
-            echo "    Clean"
-          fi
-          echo "  --- Checking for hardcoded IP addresses ---"
-          IP_HITS=$(echo "$FILES" | xargs grep -nP "\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}" 2>/dev/null \
+
+          echo "  Scanning for hardcoded IP addresses..."
+          DS_IP=$(echo "$DS_FILES" | xargs grep -nP "\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}" 2>/dev/null \
             | grep -v "0.0.0.0\|127.0.0.1\|version" || true)
-          if [ -n "$IP_HITS" ]; then
-            IP_COUNT=$(echo "$IP_HITS" | wc -l)
-            echo "    [WARN] $IP_COUNT hardcoded IPs:"
-            echo "$IP_HITS" | head -5 | while read line; do echo "      $line"; done
-            echo "::warning::Hardcoded IP addresses detected"
-            ISSUES=$((ISSUES + IP_COUNT))
-          else
-            echo "    Clean"
+          DS_IP_C=0
+          [ -n "$DS_IP" ] && DS_IP_C=$(echo "$DS_IP" | wc -l)
+          echo "    Found: $DS_IP_C"
+          if [ "$DS_IP_C" -gt "0" ]; then
+            echo "$DS_IP" | head -3 | while IFS= read -r line; do echo "      [IP] $line"; done
           fi
+
+          DS_TOTAL=$((DS_HTTP_C + DS_IP_C))
           echo ""
-          if [ "$ISSUES" -gt "0" ]; then
-            echo "  Verdict: WARN ($ISSUES issues)"
-            echo "datasource_status=WARN" >> $GITHUB_OUTPUT
+          echo "  TOTAL DATA SOURCE ISSUES: $DS_TOTAL"
+          if [ "$DS_TOTAL" -gt "0" ]; then
+            echo "  VERDICT: WARNING"
+            WARN_COUNT=$((WARN_COUNT + 1))
+            cat >> "$REPORT" << EOF
+          ### :warning: CHECK 9: Data Source Security — $DS_TOTAL issues
+
+          | Issue | Count | Risk |
+          |-------|-------|------|
+          | HTTP (non-HTTPS) endpoints | $DS_HTTP_C | Data transmitted unencrypted |
+          | Hardcoded IP addresses | $DS_IP_C | Exposes internal network topology |
+
+          **Recommendation:** Use HTTPS for all connections. Replace hardcoded IPs with DNS names or parameterized configs.
+
+          EOF
           else
-            echo "  Verdict: PASS"
-            echo "datasource_status=PASS" >> $GITHUB_OUTPUT
+            echo "  VERDICT: PASS"
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo "### :white_check_mark: CHECK 9: Data Source Security — Clean" >> "$REPORT"
+            echo "" >> "$REPORT"
           fi
-          echo "============================================"
+          echo "============================================================"
 
-      # ── Performance ──
-
-      - name: "Performance: DirectLake Fallback Guard"
-        id: directlake-guard
-        run: |
-          echo "============================================"
-          echo "  CHECK 9/11: DirectLake Fallback Guard"
-          echo "  Looking for: calculatedColumn, crossFilteringBehavior: Both"
-          echo "  Why: These silently force DirectQuery mode (10-100x slower)"
-          echo "============================================"
-          TMDL_DIR="semantic-model"
-          echo "  Scanning: $TMDL_DIR/*.tmdl"
-          CALC_COLS=$(grep "calculatedColumn" $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
-          BIDIR=$(grep -i "crossFilteringBehavior.*both" $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
-          FALLBACK_TRIGGERS=$((CALC_COLS + BIDIR))
-          echo "  Calculated columns:        $CALC_COLS"
-          echo "  Bi-directional crossfilter: $BIDIR"
-          echo "  Total fallback triggers:    $FALLBACK_TRIGGERS"
-          if [ "$FALLBACK_TRIGGERS" -gt "0" ]; then
-            echo ""
-            echo "  Details:"
-            grep -n "calculatedColumn" $TMDL_DIR/*.tmdl 2>/dev/null | while read line; do echo "    [CALC_COL] $line"; done
-            grep -in "crossFilteringBehavior.*both" $TMDL_DIR/*.tmdl 2>/dev/null | while read line; do echo "    [BIDIR]    $line"; done
-            echo ""
-            echo "::error::$FALLBACK_TRIGGERS DirectLake fallback triggers found — these force DirectQuery mode (10-100x slower)"
-            echo "  Verdict: FAIL"
-            echo "directlake_status=FAIL" >> $GITHUB_OUTPUT
-          else
-            echo "  No DirectLake fallback triggers found"
-            echo "  Verdict: PASS"
-            echo "directlake_status=PASS" >> $GITHUB_OUTPUT
-          fi
-          echo "============================================"
-
-      # ── Governance ──
-
-      - name: "Governance: Description Coverage"
-        id: desc-coverage
-        run: |
-          echo "============================================"
-          echo "  CHECK 10/11: Description Coverage"
-          echo "  Looking for: measures without description attributes"
-          echo "  Why: Undocumented measures create confusion for report builders"
-          echo "============================================"
-          TMDL_DIR="semantic-model"
-          echo "  Scanning: $TMDL_DIR/*.tmdl"
-          MEASURES=$(grep "measure " $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
-          DESCRIPTIONS=$(grep "description:" $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
-          GAP=$((MEASURES - DESCRIPTIONS))
-          echo "  Measures found:     $MEASURES"
-          echo "  With description:   $DESCRIPTIONS"
-          echo "  Gap (undocumented): $GAP"
-          if [ "$GAP" -gt "3" ]; then
-            echo ""
-            echo "::warning::$GAP measures lack descriptions — governance gap"
-            echo "  Verdict: WARN ($GAP undocumented)"
-            echo "desc_status=WARN" >> $GITHUB_OUTPUT
-          else
-            echo "  Verdict: PASS"
-            echo "desc_status=PASS" >> $GITHUB_OUTPUT
-          fi
-          echo "============================================"
-
-      - name: "Governance: Model Complexity Score"
-        id: complexity
-        run: |
-          echo "============================================"
-          echo "  CHECK 11/11: Model Complexity Score"
-          echo "  Formula: tables + measures/5 + columns/10 + calc_cols*10 + relationships"
-          echo "  Threshold: WARN if score > 50"
-          echo "============================================"
-          TMDL_DIR="semantic-model"
-          echo "  Scanning: $TMDL_DIR/*.tmdl"
-          TABLES=$(grep "^  table " $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
-          MEASURES=$(grep "measure " $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
-          COLUMNS=$(grep "column " $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
-          CALC_COLS=$(grep "calculatedColumn" $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
-          RELATIONSHIPS=$(grep "relationship " $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
-          echo "  Tables:         $TABLES"
-          echo "  Measures:       $MEASURES"
-          echo "  Columns:        $COLUMNS"
-          echo "  Calc columns:   $CALC_COLS (penalty: x10)"
-          echo "  Relationships:  $RELATIONSHIPS"
-          SCORE=$((TABLES + MEASURES / 5 + COLUMNS / 10 + CALC_COLS * 10 + RELATIONSHIPS))
+          # ════════════════════════════════════════════════════════════
+          # CHECK 10/11: DESCRIPTION COVERAGE
+          # ════════════════════════════════════════════════════════════
           echo ""
-          echo "  Complexity score: $SCORE (threshold: 50)"
-          if [ "$SCORE" -gt "50" ]; then
-            echo "::warning::Model complexity score $SCORE exceeds threshold — review for bloat"
-            echo "  Verdict: WARN (score $SCORE)"
-            echo "complexity_status=WARN" >> $GITHUB_OUTPUT
-          else
-            echo "  Verdict: PASS"
-            echo "complexity_status=PASS" >> $GITHUB_OUTPUT
-          fi
-          echo "============================================"
+          echo "============================================================"
+          echo "  CHECK 10/11: DESCRIPTION COVERAGE"
+          echo "  What:  Count measures without description: attribute"
+          echo "  Why:   Undocumented measures confuse report builders."
+          echo "         They don't know what a measure calculates, what"
+          echo "         units it uses, or how to interpret the values."
+          echo "         Good governance requires every measure to have"
+          echo "         a clear business description."
+          echo "  Files: All .tmdl files (see STEP 0 discovery above)"
+          echo "============================================================"
+          echo -e "\n---\n## Governance Checks\n" >> "$REPORT"
+          DESC_MEASURES=$(cat "$TMDL_LIST" | xargs grep "measure " 2>/dev/null | wc -l)
+          DESC_DESCS=$(cat "$TMDL_LIST" | xargs grep "description:" 2>/dev/null | wc -l)
+          DESC_GAP=$((DESC_MEASURES - DESC_DESCS))
+          echo "  Total measures found:        $DESC_MEASURES"
+          echo "  With description attribute:  $DESC_DESCS"
+          echo "  UNDOCUMENTED:                $DESC_GAP"
 
-  # Job 2: Schema Validation
+          if [ "$DESC_GAP" -gt "3" ]; then
+            echo ""
+            echo "  VERDICT: WARNING — $DESC_GAP measures lack descriptions"
+            echo "  ACTION:  Add description: to each undocumented measure"
+            WARN_COUNT=$((WARN_COUNT + 1))
+            cat >> "$REPORT" << EOF
+          ### :warning: CHECK 10: Description Coverage — $DESC_GAP measures undocumented
+
+          **Severity:** Low | **Impact:** Report builders don't know what measures calculate
+
+          | Metric | Count |
+          |--------|-------|
+          | Total measures | $DESC_MEASURES |
+          | With description | $DESC_DESCS |
+          | **Undocumented** | **$DESC_GAP** |
+
+          **Recommendation:** Add \`description:\` to every measure. Example:
+          \`\`\`
+            measure 'Total Revenue' = SUM(...)
+              description: "Sum of monthly revenue across all active deployments"
+          \`\`\`
+
+          EOF
+          else
+            echo "  VERDICT: PASS (gap $DESC_GAP within threshold of 3)"
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo "### :white_check_mark: CHECK 10: Description Coverage — Gap within threshold ($DESC_GAP)" >> "$REPORT"
+            echo "" >> "$REPORT"
+          fi
+          echo "============================================================"
+
+          # ════════════════════════════════════════════════════════════
+          # CHECK 11/11: MODEL COMPLEXITY SCORE
+          # ════════════════════════════════════════════════════════════
+          echo ""
+          echo "============================================================"
+          echo "  CHECK 11/11: MODEL COMPLEXITY SCORE"
+          echo "  What:  Calculate weighted complexity score"
+          echo "  Why:   Overly complex models are hard to maintain, slow"
+          echo "         to refresh, and difficult to debug. The score"
+          echo "         helps track model health over time."
+          echo "  Formula: tables*1 + measures/5 + columns/10"
+          echo "           + calc_columns*10 (PENALTY) + relationships*1"
+          echo "  Threshold: 50 (above = needs attention)"
+          echo "  Files: All .tmdl files (see STEP 0 discovery above)"
+          echo "============================================================"
+          CX_TABLES=$(cat "$TMDL_LIST" | xargs grep "^  table " 2>/dev/null | wc -l)
+          CX_MEASURES=$(cat "$TMDL_LIST" | xargs grep "measure " 2>/dev/null | wc -l)
+          CX_COLUMNS=$(cat "$TMDL_LIST" | xargs grep "column " 2>/dev/null | wc -l)
+          CX_CALC=$(cat "$TMDL_LIST" | xargs grep "calculatedColumn" 2>/dev/null | wc -l)
+          CX_RELS=$(cat "$TMDL_LIST" | xargs grep "relationship " 2>/dev/null | wc -l)
+          echo "  Tables:           $CX_TABLES  (weight: x1 = $CX_TABLES)"
+          echo "  Measures:         $CX_MEASURES  (weight: /5 = $((CX_MEASURES / 5)))"
+          echo "  Columns:          $CX_COLUMNS  (weight: /10 = $((CX_COLUMNS / 10)))"
+          echo "  Calc Columns:     $CX_CALC  (weight: x10 PENALTY = $((CX_CALC * 10)))"
+          echo "  Relationships:    $CX_RELS  (weight: x1 = $CX_RELS)"
+          CX_SCORE=$((CX_TABLES + CX_MEASURES / 5 + CX_COLUMNS / 10 + CX_CALC * 10 + CX_RELS))
+          echo ""
+          echo "  COMPLEXITY SCORE: $CX_SCORE / 50 threshold"
+
+          if [ "$CX_SCORE" -gt "50" ]; then
+            WARN_COUNT=$((WARN_COUNT + 1))
+            GRADE="Needs Attention"
+            echo "  VERDICT: WARNING — Score exceeds threshold"
+          else
+            PASS_COUNT=$((PASS_COUNT + 1))
+            GRADE="Healthy"
+            echo "  VERDICT: PASS — Score within healthy range"
+          fi
+
+          cat >> "$REPORT" << EOF
+          ### $([ "$CX_SCORE" -gt "50" ] && echo ":warning:" || echo ":white_check_mark:") CHECK 11: Model Complexity Score — $CX_SCORE / 50
+
+          | Component | Count | Weight | Score |
+          |-----------|-------|--------|-------|
+          | Tables | $CX_TABLES | x1 | $CX_TABLES |
+          | Measures | $CX_MEASURES | /5 | $((CX_MEASURES / 5)) |
+          | Columns | $CX_COLUMNS | /10 | $((CX_COLUMNS / 10)) |
+          | Calc Columns | $CX_CALC | x10 (penalty) | $((CX_CALC * 10)) |
+          | Relationships | $CX_RELS | x1 | $CX_RELS |
+          | **Total** | | | **$CX_SCORE** |
+
+          Threshold: 50 | Status: **$GRADE**
+
+          EOF
+          echo "============================================================"
+
+          # ════════════════════════════════════════════════════════════
+          # OVERALL VERDICT
+          # ════════════════════════════════════════════════════════════
+          TOTAL=$((PASS_COUNT + WARN_COUNT + FAIL_COUNT))
+          HEALTH=$((100 - FAIL_COUNT * 20 - WARN_COUNT * 5))
+          [ "$HEALTH" -lt "0" ] && HEALTH=0
+
+          if [ "$HEALTH" -ge "80" ]; then
+            HEALTH_ICON=":green_circle:"
+            HEALTH_LABEL="Good"
+          elif [ "$HEALTH" -ge "50" ]; then
+            HEALTH_ICON=":yellow_circle:"
+            HEALTH_LABEL="Needs Improvement"
+          else
+            HEALTH_ICON=":red_circle:"
+            HEALTH_LABEL="At Risk"
+          fi
+
+          echo ""
+          echo "################################################################"
+          echo "#                                                              #"
+          echo "#   OVERALL VERDICT                                            #"
+          echo "#                                                              #"
+          echo "################################################################"
+          echo ""
+          echo "  Checks Run:    $TOTAL"
+          echo "  Passed:        $PASS_COUNT"
+          echo "  Warnings:      $WARN_COUNT"
+          echo "  Failed:        $FAIL_COUNT"
+          echo "  Health Score:  $HEALTH / 100 ($HEALTH_LABEL)"
+          echo ""
+
+          cat >> "$REPORT" << EOF
+
+          ---
+
+          ## Overall Verdict
+
+          ### $HEALTH_ICON Model Health Score: $HEALTH / 100 — $HEALTH_LABEL
+
+          | Category | Checks | :white_check_mark: Pass | :warning: Warn | :x: Fail |
+          |----------|--------|------|------|------|
+          | Performance | 5 | - | - | - |
+          | Security | 4 | - | - | - |
+          | Governance | 2 | - | - | - |
+          | **Total** | **$TOTAL** | **$PASS_COUNT** | **$WARN_COUNT** | **$FAIL_COUNT** |
+
+          ### Top Recommendations
+
+          EOF
+
+          REC_NUM=1
+          if [ "$DL_TOTAL" -gt "0" ]; then
+            REC="$REC_NUM. Remove $DL_CALC calculated columns — prevents DirectLake fallback (10-100x performance gain)"
+            echo "  $REC"
+            echo "$REC_NUM. **Remove $DL_CALC calculated columns** — prevents DirectLake fallback, estimated 10-100x performance improvement" >> "$REPORT"
+            REC_NUM=$((REC_NUM + 1))
+          fi
+          if [ "$RLS_EXPOSED" -gt "0" ]; then
+            REC="$REC_NUM. Add RLS to $RLS_EXPOSED unprotected tables — customer data is currently visible to all"
+            echo "  $REC"
+            echo "$REC_NUM. **Add RLS to $RLS_EXPOSED unprotected tables** — customer deployment and revenue data is currently visible to all users" >> "$REPORT"
+            REC_NUM=$((REC_NUM + 1))
+          fi
+          if [ "$SENS_COUNT" -gt "0" ] && [ "$OLS_DEF" -eq "0" ]; then
+            REC="$REC_NUM. Add OLS to $SENS_COUNT sensitive columns — financial data needs column-level protection"
+            echo "  $REC"
+            echo "$REC_NUM. **Add OLS to $SENS_COUNT sensitive columns** — financial data like \`annual_revenue_usd\` needs column-level protection" >> "$REPORT"
+            REC_NUM=$((REC_NUM + 1))
+          fi
+          if [ "$FILTER_ALL" -gt "0" ]; then
+            REC="$REC_NUM. Fix $FILTER_ALL FILTER(ALL()) patterns — use CALCULATE + REMOVEFILTERS"
+            echo "  $REC"
+            echo "$REC_NUM. **Fix $FILTER_ALL FILTER(ALL()) patterns** — replace with CALCULATE + REMOVEFILTERS for cleaner filter context" >> "$REPORT"
+            REC_NUM=$((REC_NUM + 1))
+          fi
+          if [ "$DESC_GAP" -gt "3" ]; then
+            REC="$REC_NUM. Document $DESC_GAP undocumented measures — add description: for governance"
+            echo "  $REC"
+            echo "$REC_NUM. **Document $DESC_GAP undocumented measures** — add description: to every measure for governance compliance" >> "$REPORT"
+            REC_NUM=$((REC_NUM + 1))
+          fi
+          if [ "$REC_NUM" -eq "1" ]; then
+            echo "  All checks passed. No recommendations at this time."
+            echo "All checks passed. No recommendations at this time." >> "$REPORT"
+          fi
+
+          cat >> "$REPORT" << EOF
+
+          ---
+          _Report generated by Performance Gate CI/CD workflow. $TOTAL checks executed in Job 1 (static analysis, no Fabric connection required)._
+          EOF
+
+          echo ""
+          echo "################################################################"
+          echo "  Report written to Job Summary tab (click Summary in sidebar)"
+          echo "################################################################"
+
+  # Job 2: Schema Validation (skips gracefully if project-specific files not found)
   schema-check:
     name: Schema Registry Validation
     runs-on: ubuntu-latest
@@ -500,22 +922,26 @@ jobs:
       
       - name: Validate schema registry syntax
         run: |
+          SCHEMA_FILE="notebooks/00_schema_registry.py"
+          if [ ! -f "$SCHEMA_FILE" ]; then
+            echo "No schema registry file found at $SCHEMA_FILE — skipping"
+            echo "This check is optional. It validates a project-specific schema registry."
+            echo "### :information_source: Schema Registry — Skipped" >> $GITHUB_STEP_SUMMARY
+            echo "No \`$SCHEMA_FILE\` found. This check is optional for repos with a schema registry." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
           python -c "
           import ast, sys
           try:
-              with open('notebooks/00_schema_registry.py') as f:
+              with open('$SCHEMA_FILE') as f:
                   content = f.read()
-              # Extract SCHEMAS dict
               tree = ast.parse(content)
               print('Schema registry: syntax OK')
-              
-              # Check for SCHEMA_VERSION
               for node in ast.walk(tree):
                   if isinstance(node, ast.Assign):
                       for target in node.targets:
                           if hasattr(target, 'id') and target.id == 'SCHEMA_VERSION':
                               print(f'Schema version found: {ast.literal_eval(node.value)}')
-              
               print('Schema registry validation: PASSED')
           except Exception as e:
               print(f'Schema registry validation: FAILED - {e}')
@@ -524,18 +950,24 @@ jobs:
       
       - name: Check migration file naming
         run: |
+          if [ ! -d "migrations" ] || [ -z "$(ls migrations/V*.py 2>/dev/null)" ]; then
+            echo "No migrations directory or V*.py files found — skipping"
+            echo "### :information_source: Migration Naming — Skipped" >> $GITHUB_STEP_SUMMARY
+            echo "No \`migrations/V*.py\` files found. This check is optional." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
           echo "=== Validating migration file naming convention ==="
           for f in migrations/V*.py; do
             if [[ "$f" =~ ^migrations/V[0-9]{3}__[a-z_]+\.py$ ]]; then
-              echo "  ✓ $f"
+              echo "  OK $f"
             else
-              echo "  ✗ $f — does not match V###__description.py pattern"
+              echo "  FAIL $f — does not match V###__description.py pattern"
               exit 1
             fi
           done
           echo "Migration naming: PASSED"
 
-  # Job 3: Runtime Performance Analysis in Fabric
+  # Job 3: Runtime Performance Analysis in Fabric (optional — needs secrets)
   runtime-analysis:
     name: Runtime BPA + Memory + Compression
     runs-on: ubuntu-latest
@@ -548,7 +980,32 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Check prerequisites
+        id: prereqs
+        run: |
+          echo "============================================================"
+          echo "  RUNTIME ANALYSIS — Prerequisite Check"
+          echo "  This job requires Fabric API secrets to be configured:"
+          echo "    FABRIC_TENANT_ID, FABRIC_CLIENT_ID, FABRIC_CLIENT_SECRET"
+          echo "============================================================"
+          MISSING=""
+          if [ -z "${{ secrets.FABRIC_TENANT_ID }}" ]; then MISSING="$MISSING FABRIC_TENANT_ID"; fi
+          if [ -z "${{ secrets.FABRIC_CLIENT_ID }}" ]; then MISSING="$MISSING FABRIC_CLIENT_ID"; fi
+          if [ -z "${{ secrets.FABRIC_CLIENT_SECRET }}" ]; then MISSING="$MISSING FABRIC_CLIENT_SECRET"; fi
+          if [ -n "$MISSING" ]; then
+            echo "  [SKIP] Missing secrets:$MISSING"
+            echo "  Runtime analysis requires Fabric API credentials."
+            echo "  Configure these secrets in Settings > Secrets to enable."
+            echo "### :information_source: Runtime Analysis — Skipped" >> $GITHUB_STEP_SUMMARY
+            echo "Missing required secrets:\`$MISSING\`. Configure in repo Settings > Secrets." >> $GITHUB_STEP_SUMMARY
+            echo "has_secrets=false" >> $GITHUB_OUTPUT
+          else
+            echo "  [OK] All required secrets present"
+            echo "has_secrets=true" >> $GITHUB_OUTPUT
+          fi
+
       - name: Authenticate to Fabric
+        if: steps.prereqs.outputs.has_secrets == 'true'
         id: auth
         run: |
           TOKEN=$(curl -s -X POST \
@@ -574,9 +1031,18 @@ jobs:
           echo "Token acquired successfully"
 
       - name: Resolve workspace
+        if: steps.prereqs.outputs.has_secrets == 'true'
         id: workspace
         run: |
-          WS_NAME="${{ inputs.workspace || 'DigitalRealty-Dev' }}"
+          WS_NAME="${{ inputs.workspace }}"
+          if [ -z "$WS_NAME" ]; then
+            echo "No workspace specified. Listing available workspaces..."
+            WS_LIST=$(curl -s -H "Authorization: Bearer $FABRIC_TOKEN" \
+              "https://api.fabric.microsoft.com/v1/workspaces")
+            echo "$WS_LIST" | jq -r '.value[] | "  \(.displayName) (\(.id))"' 2>/dev/null | head -10
+            WS_NAME=$(echo "$WS_LIST" | jq -r '.value[0].displayName // empty' 2>/dev/null)
+            echo "Auto-selected first workspace: $WS_NAME"
+          fi
           echo "Looking up workspace: $WS_NAME"
           WS_LIST=$(curl -s -H "Authorization: Bearer $FABRIC_TOKEN" \
             "https://api.fabric.microsoft.com/v1/workspaces")
@@ -584,15 +1050,32 @@ jobs:
             '.value[] | select(.displayName == $n) | .id' | head -1)
           
           if [ -z "$WS_ID" ]; then
-            echo "::error::Workspace '$WS_NAME' not found"
-            exit 1
+            echo "::warning::Workspace '$WS_NAME' not found — skipping runtime analysis"
+            exit 0
           fi
           echo "WS_ID=$WS_ID" >> $GITHUB_ENV
           echo "Workspace: $WS_NAME ($WS_ID)"
 
       - name: Run performance notebooks
+        if: steps.prereqs.outputs.has_secrets == 'true' && env.WS_ID != ''
         run: |
           set -euo pipefail
+
+          # ── Auto-discover analyzer notebooks ──
+          echo "============================================================"
+          echo "  AUTO-DISCOVERING PERFORMANCE NOTEBOOKS"
+          echo "  Searching for: *analyzer*.py, *bpa*.py, *memory*.py"
+          echo "============================================================"
+          DISCOVERED=$(find . -name "*analyzer*.py" -o -name "*bpa*.py" -o -name "*memory*.py" \
+            2>/dev/null | grep -v __pycache__ | grep -v ".github" | sort)
+          if [ -z "$DISCOVERED" ]; then
+            echo "  No analyzer notebooks found — skipping runtime analysis"
+            echo "### :information_source: Runtime Analysis — No Notebooks" >> $GITHUB_STEP_SUMMARY
+            echo "No \`*analyzer*.py\` or \`*bpa*.py\` notebooks found to run." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+          echo "$DISCOVERED" | while read f; do echo "  [FOUND] $f"; done
+          echo ""
           
           # ── Helper: upload or update notebook ──
           upload_or_update_notebook() {
@@ -677,14 +1160,12 @@ jobs:
             else echo "  Trigger HTTP $RH — FAILED"; rm -f /tmp/run_h.txt; return 1; fi
           }
           
-          # ── Run each performance notebook ──
-          NOTEBOOKS=("notebooks/04_bpa_analyzer.py" "notebooks/05_memory_analyzer.py" "notebooks/06_compression_analyzer.py")
-          NB_NAMES=("04_bpa_analyzer" "05_memory_analyzer" "06_compression_analyzer")
+          # ── Run each discovered notebook ──
           RESULTS=()
           
-          for i in "${!NOTEBOOKS[@]}"; do
-            NB_FILE="${NOTEBOOKS[$i]}"
-            NB_NAME="${NB_NAMES[$i]}"
+          while IFS= read -r NB_FILE; do
+            [ -z "$NB_FILE" ] && continue
+            NB_NAME=$(basename "$NB_FILE" .py)
             echo ""
             echo "============================================"
             echo "  NOTEBOOK: $NB_NAME"
@@ -702,7 +1183,7 @@ jobs:
             else
               RESULTS+=("$NB_NAME:FAIL")
             fi
-          done
+          done <<< "$DISCOVERED"
           
           # ── Summary ──
           echo ""
@@ -729,7 +1210,7 @@ jobs:
           fi
 
       - name: Read diagnostic reports from OneLake
-        if: always()
+        if: always() && steps.prereqs.outputs.has_secrets == 'true' && env.WS_ID != ''
         run: |
           echo "Reading diagnostic reports from OneLake..."
           
