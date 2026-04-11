@@ -480,6 +480,9 @@ with open(OUT_PATH, "w") as f:
     json.dump(payload, f)
 
 print(f"Notebook payload -> {OUT_PATH}")
-print(f"Tables: {len(TABLES)}")
-for t in TABLES:
-    print(f"  {t}")
+total_tables = sum(len(v) for v in SCHEMA_TABLES.values())
+print(f"Tables: {total_tables} across {len(SCHEMA_TABLES)} schema(s)")
+for schema, tbls in sorted(SCHEMA_TABLES.items()):
+    for t in tbls:
+        prefix = f"{schema}." if schema else ""
+        print(f"  {prefix}{t}")
