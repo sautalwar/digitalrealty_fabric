@@ -29,8 +29,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: "Performance Gate — Full Static Analysis"
-        id: report
+      - name: "Discovery — File Detection & Report Header"
+        id: discovery
         run: |
           set +e  # Continue on errors so ALL checks run
           REPORT="$GITHUB_STEP_SUMMARY"
@@ -133,7 +133,24 @@ jobs:
           echo "" >> "$REPORT"
 
           # ── Tracking ──
-          PASS_COUNT=0; WARN_COUNT=0; FAIL_COUNT=0
+          # Initialize counters file for cross-step persistence
+          echo "PASS_COUNT=0" > /tmp/gate_counters.txt
+          echo "WARN_COUNT=0" >> /tmp/gate_counters.txt
+          echo "FAIL_COUNT=0" >> /tmp/gate_counters.txt
+
+          # Export variables for subsequent steps
+          echo "TMDL_LIST=$TMDL_LIST" >> $GITHUB_ENV
+          echo "TMDL_COUNT=$TMDL_COUNT" >> $GITHUB_ENV
+          echo "PBIP_COUNT=$PBIP_COUNT" >> $GITHUB_ENV
+          echo "PBIR_COUNT=$PBIR_COUNT" >> $GITHUB_ENV
+          echo "PBIX_COUNT=$PBIX_COUNT" >> $GITHUB_ENV
+          echo "TOTAL_FILES=$TOTAL_FILES" >> $GITHUB_ENV
+
+      - name: "Performance Checks (1-5)"
+        run: |
+          set +e
+          REPORT="$GITHUB_STEP_SUMMARY"
+          source /tmp/gate_counters.txt
 
           # ════════════════════════════════════════════════════════════
           # CHECK 1/11: CALCULATED COLUMNS
@@ -450,6 +467,22 @@ jobs:
           fi
           echo "============================================================"
 
+          # Save counters for next step
+          echo "PASS_COUNT=$PASS_COUNT" > /tmp/gate_counters.txt
+          echo "WARN_COUNT=$WARN_COUNT" >> /tmp/gate_counters.txt
+          echo "FAIL_COUNT=$FAIL_COUNT" >> /tmp/gate_counters.txt
+
+          # Export check variables for Verdict step
+          echo "FILTER_ALL=$FILTER_ALL" >> $GITHUB_ENV
+          echo "DL_TOTAL=$DL_TOTAL" >> $GITHUB_ENV
+          echo "DL_CALC=$DL_CALC" >> $GITHUB_ENV
+
+      - name: "Security Checks (6-9)"
+        run: |
+          set +e
+          REPORT="$GITHUB_STEP_SUMMARY"
+          source /tmp/gate_counters.txt
+
           # ════════════════════════════════════════════════════════════
           # CHECK 6/11: ROW-LEVEL SECURITY (RLS) COVERAGE
           # ════════════════════════════════════════════════════════════
@@ -701,6 +734,22 @@ jobs:
           fi
           echo "============================================================"
 
+          # Save counters for next step
+          echo "PASS_COUNT=$PASS_COUNT" > /tmp/gate_counters.txt
+          echo "WARN_COUNT=$WARN_COUNT" >> /tmp/gate_counters.txt
+          echo "FAIL_COUNT=$FAIL_COUNT" >> /tmp/gate_counters.txt
+
+          # Export check variables for Verdict step
+          echo "RLS_EXPOSED=$RLS_EXPOSED" >> $GITHUB_ENV
+          echo "SENS_COUNT=$SENS_COUNT" >> $GITHUB_ENV
+          echo "OLS_DEF=$OLS_DEF" >> $GITHUB_ENV
+
+      - name: "Governance Checks (10-11)"
+        run: |
+          set +e
+          REPORT="$GITHUB_STEP_SUMMARY"
+          source /tmp/gate_counters.txt
+
           # ════════════════════════════════════════════════════════════
           # CHECK 10/11: DESCRIPTION COVERAGE
           # ════════════════════════════════════════════════════════════
@@ -809,6 +858,20 @@ jobs:
 
           EOF
           echo "============================================================"
+
+          # Save counters for next step
+          echo "PASS_COUNT=$PASS_COUNT" > /tmp/gate_counters.txt
+          echo "WARN_COUNT=$WARN_COUNT" >> /tmp/gate_counters.txt
+          echo "FAIL_COUNT=$FAIL_COUNT" >> /tmp/gate_counters.txt
+
+          # Export check variables for Verdict step
+          echo "DESC_GAP=$DESC_GAP" >> $GITHUB_ENV
+
+      - name: "Verdict — Health Score & Recommendations"
+        run: |
+          set +e
+          REPORT="$GITHUB_STEP_SUMMARY"
+          source /tmp/gate_counters.txt
 
           # ════════════════════════════════════════════════════════════
           # OVERALL VERDICT
