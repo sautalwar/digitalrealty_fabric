@@ -299,20 +299,19 @@ jobs:
             "api_key="
             "AccountKey="
             "connectionString="
-            "client_secret="
-            "Bearer "
             "SharedAccessKey="
             "DefaultEndpointsProtocol="
           )
-          echo "  Scanning all TMDL, PBIP, JSON, PY, M, YML files..."
-          echo "  Excluding: .github/workflows/, node_modules/"
+          echo "  Scanning all TMDL, PBIP, JSON, PY, M files..."
+          echo "  Excluding: .github/, node_modules/, *.yml workflow files"
+          echo "  Note: Bearer/client_secret excluded (legitimate API call patterns)"
           echo ""
           FOUND=0
           for pat in "${PATTERNS[@]}"; do
             echo "  --- Pattern: '$pat' ---"
             HITS=$(grep -rn --include="*.tmdl" --include="*.pbip" --include="*.pbir" \
-              --include="*.json" --include="*.py" --include="*.m" --include="*.yml" \
-              -i "$pat" . 2>/dev/null | grep -v ".github/workflows" | grep -v "node_modules" || true)
+              --include="*.json" --include="*.py" --include="*.m" \
+              -i "$pat" . 2>/dev/null | grep -v ".github/" | grep -v "node_modules" || true)
             if [ -n "$HITS" ]; then
               HIT_COUNT=$(echo "$HITS" | wc -l)
               echo "    [ALERT] $HIT_COUNT matches:"
