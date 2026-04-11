@@ -733,14 +733,28 @@ jobs:
               if [ -n "$JL" ]; then
                 for a in $(seq 1 60); do
                   sleep 30
-                  local JS=$(curl -s -H "Authorization: Bearer $TK" "$JL" | jq -r '.status // empty')
+                  local FULL_RESP=$(curl -s -H "Authorization: Bearer $TK" "$JL")
+                  local JS=$(echo "$FULL_RESP" | jq -r '.status // empty')
                   echo "    Poll $a/60: $JS"
                   if [ "$JS" = "Completed" ]; then echo "  COMPLETED"; rm -f /tmp/run_h.txt; return 0; fi
-                  if [ "$JS" = "Failed" ] || [ "$JS" = "Cancelled" ]; then echo "  $JS"; rm -f /tmp/run_h.txt; return 1; fi
+                  if [ "$JS" = "Failed" ] || [ "$JS" = "Cancelled" ]; then
+                    echo "  $JS"
+                    # Capture failure details from the job status response
+                    local FAIL_REASON=$(echo "$FULL_RESP" | jq -r '.failureReason // empty')
+                    local FAIL_MSG=$(echo "$FULL_RESP" | jq -r '.error.message // empty')
+                    local FAIL_ERR=$(echo "$FULL_RESP" | jq -r '.error.errorCode // empty')
+                    [ -n "$FAIL_REASON" ] && echo "  FAILURE REASON: $FAIL_REASON"
+                    [ -n "$FAIL_ERR" ]    && echo "  ERROR CODE: $FAIL_ERR"
+                    [ -n "$FAIL_MSG" ]    && echo "  ERROR MESSAGE: $FAIL_MSG"
+                    # Dump full response for debugging
+                    echo "  FULL JOB STATUS:"
+                    echo "$FULL_RESP" | jq '.' 2>/dev/null || echo "$FULL_RESP"
+                    rm -f /tmp/run_h.txt; return 1
+                  fi
                 done
                 echo "  Timed out (30 min)"; rm -f /tmp/run_h.txt; return 1
               else echo "  No Location header"; rm -f /tmp/run_h.txt; return 1; fi
-            else echo "  Trigger HTTP $RH — FAILED"; rm -f /tmp/run_h.txt; return 1; fi
+            else echo "  Trigger HTTP $RH — FAILED"; echo "  Response: $(echo "$RR" | head -5)"; rm -f /tmp/run_h.txt; return 1; fi
           }
 
           # ════════════════════════════════════════════════════════════════════

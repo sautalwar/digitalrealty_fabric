@@ -101,7 +101,8 @@ if has_source:
         "# Auto-generated — Digital Realty Full Data Sync (Multi-Schema)\n"
         "# Reads from Dev OneLake -> writes to this workspace lakehouse\n"
         f"# Schema version: {SCHEMA_VERSION}\n"
-        "import time as _time\n\n"
+        "import time as _time\n"
+        "import traceback as _tb\n\n"
         f'DEV_WS_ID = "{SOURCE_WORKSPACE_ID}"\n'
         f'DEV_LH_ID = "{SOURCE_LAKEHOUSE_ID}"\n'
         f"CI_SCHEMA_TABLES = {ci_schema_tables_repr}  # from CI discovery\n"
@@ -240,6 +241,20 @@ if has_source:
         "    synced, failed, skipped_empty = [], [], []\n"
         "    total_rows_copied = 0\n"
         "    total_cols_added = 0\n\n"
+        "    # ── Pre-create non-default schemas in target lakehouse ────────\n"
+        "    _schemas_to_create = [s for s in SCHEMA_TABLES.keys() if s and s != 'dbo']\n"
+        "    if _schemas_to_create:\n"
+        '        print(f"\\nPre-creating {len(_schemas_to_create)} non-default schema(s): {_schemas_to_create}")\n'
+        "        for _sn in sorted(_schemas_to_create):\n"
+        "            try:\n"
+        '                spark.sql(f"CREATE SCHEMA IF NOT EXISTS {_sn}")\n'
+        '                print(f"  Schema {_sn!r}: OK (created or exists)")\n'
+        "            except Exception as schema_err:\n"
+        '                print(f"  Schema {_sn!r}: WARNING - {schema_err}")\n'
+        '                print(f"    Will attempt table writes anyway...")\n'
+        "    else:\n"
+        '        print("\\nNo non-default schemas to create (all tables use dbo or no schema)")\n'
+        '    print("")\n\n'
         "    for idx, (schema_name, table) in enumerate(_sync_pairs, 1):\n"
         "        tbl_prefix = f'{schema_name}.' if schema_name else ''\n"
         "        source_path = f'{dev_base_path}/{schema_name}' if schema_name else dev_base_path\n"
@@ -424,6 +439,24 @@ else:
     )
 
 # ── Notebook metadata — attach lakehouse so spark.sql() works ─────────────────
+
+# Wrap inner_code in a top-level try/except so notebook ALWAYS prints diagnostics
+inner_code_wrapped = "import traceback as _tb\ntry:\n"
+for line in inner_code.split("\n"):
+    inner_code_wrapped += "    " + line + "\n"
+inner_code_wrapped += (
+    "except Exception as _fatal:\n"
+    "    print('\\n' + '!' * 72)\n"
+    "    print('FATAL UNHANDLED ERROR')\n"
+    "    print('!' * 72)\n"
+    "    print(f'Error type : {type(_fatal).__name__}')\n"
+    "    print(f'Error msg  : {_fatal}')\n"
+    "    print('Full traceback:')\n"
+    "    _tb.print_exc()\n"
+    "    print('!' * 72)\n"
+    "    raise\n"
+)
+inner_code = inner_code_wrapped
 nb_metadata = {
     "kernelspec": {
         "display_name": "Synapse PySpark",
