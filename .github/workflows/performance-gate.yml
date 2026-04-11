@@ -147,7 +147,236 @@ jobs:
           done
           echo "Migration naming: PASSED"
 
-  # Job 3: Combined Gate Decision
+  # Job 3: Runtime Performance Analysis in Fabric
+  runtime-analysis:
+    name: Runtime BPA + Memory + Compression
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'run-perf')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Authenticate to Fabric
+        id: auth
+        run: |
+          TOKEN=$(curl -s -X POST \
+            "https://login.microsoftonline.com/${{ secrets.FABRIC_TENANT_ID }}/oauth2/v2.0/token" \
+            -d "client_id=${{ secrets.FABRIC_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.FABRIC_CLIENT_SECRET }}" \
+            -d "scope=https://api.fabric.microsoft.com/.default" \
+            -d "grant_type=client_credentials" | jq -r '.access_token')
+          
+          STORAGE_TOKEN=$(curl -s -X POST \
+            "https://login.microsoftonline.com/${{ secrets.FABRIC_TENANT_ID }}/oauth2/v2.0/token" \
+            -d "client_id=${{ secrets.FABRIC_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.FABRIC_CLIENT_SECRET }}" \
+            -d "scope=https://storage.azure.com/.default" \
+            -d "grant_type=client_credentials" | jq -r '.access_token')
+          
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::Failed to get Fabric token"
+            exit 1
+          fi
+          echo "FABRIC_TOKEN=$TOKEN" >> $GITHUB_ENV
+          echo "STORAGE_TOKEN=$STORAGE_TOKEN" >> $GITHUB_ENV
+          echo "Token acquired successfully"
+
+      - name: Resolve workspace
+        id: workspace
+        run: |
+          WS_NAME="${{ inputs.workspace || 'DigitalRealty-Dev' }}"
+          echo "Looking up workspace: $WS_NAME"
+          WS_LIST=$(curl -s -H "Authorization: Bearer $FABRIC_TOKEN" \
+            "https://api.fabric.microsoft.com/v1/workspaces")
+          WS_ID=$(echo "$WS_LIST" | jq -r --arg n "$WS_NAME" \
+            '.value[] | select(.displayName == $n) | .id' | head -1)
+          
+          if [ -z "$WS_ID" ]; then
+            echo "::error::Workspace '$WS_NAME' not found"
+            exit 1
+          fi
+          echo "WS_ID=$WS_ID" >> $GITHUB_ENV
+          echo "Workspace: $WS_NAME ($WS_ID)"
+
+      - name: Run performance notebooks
+        run: |
+          set -euo pipefail
+          
+          # ── Helper: upload or update notebook ──
+          upload_or_update_notebook() {
+            local NB_FILE="$1" NB_NAME="$2" WS="$3" TK="$4"
+            echo "  Uploading $NB_NAME..."
+            
+            local NB_CONTENT=$(base64 -w0 "$NB_FILE")
+            local PAYLOAD=$(cat <<EOFPAYLOAD
+          {
+            "displayName": "$NB_NAME",
+            "type": "Notebook",
+            "definition": {
+              "format": "ipynb",
+              "parts": [
+                {
+                  "path": "notebook-content.py",
+                  "payload": "$NB_CONTENT",
+                  "payloadType": "InlineBase64"
+                }
+              ]
+            }
+          }
+          EOFPAYLOAD
+          )
+            
+            local RESP=$(curl -s -w "\n%{http_code}" -D /tmp/nb_hdrs.txt \
+              -H "Authorization: Bearer $TK" -H "Content-Type: application/json" \
+              "https://api.fabric.microsoft.com/v1/workspaces/$WS/items" \
+              -d "$PAYLOAD")
+            local HTTP=$(echo "$RESP" | tail -1)
+            local BODY=$(echo "$RESP" | head -n -1)
+            local NB_ID=""
+            
+            if [ "$HTTP" = "201" ]; then
+              NB_ID=$(echo "$BODY" | jq -r '.id // empty')
+              echo "  Created: $NB_ID"
+            else
+              # Try to find existing and update
+              NB_ID=$(curl -s -H "Authorization: Bearer $TK" \
+                "https://api.fabric.microsoft.com/v1/workspaces/$WS/items?type=Notebook" \
+                | jq -r --arg n "$NB_NAME" '.value[] | select(.displayName == $n) | .id // empty')
+              if [ -n "$NB_ID" ]; then
+                echo "  Found existing ($NB_ID) — updating..."
+                local NB_DEF=$(echo "$PAYLOAD" | jq '{definition: .definition}')
+                curl -s -X POST \
+                  -H "Authorization: Bearer $TK" -H "Content-Type: application/json" \
+                  "https://api.fabric.microsoft.com/v1/workspaces/$WS/items/$NB_ID/updateDefinition" \
+                  -d "$NB_DEF" >/dev/null 2>&1
+                sleep 10
+              fi
+            fi
+            rm -f /tmp/nb_hdrs.txt
+            echo "$NB_ID"
+          }
+          
+          # ── Helper: run and poll ──
+          run_and_poll() {
+            local NB_ID="$1" WS="$2" TK="$3" NB_NAME="$4"
+            echo "  Running $NB_NAME ($NB_ID)..."
+            local RR=$(curl -s -w "\n%{http_code}" -D /tmp/run_h.txt -X POST \
+              -H "Authorization: Bearer $TK" -H "Content-Type: application/json" -H "Content-Length: 0" \
+              "https://api.fabric.microsoft.com/v1/workspaces/$WS/items/$NB_ID/jobs/instances?jobType=RunNotebook")
+            local RH=$(echo "$RR" | tail -1)
+            if [ "$RH" = "202" ] || [ "$RH" = "200" ]; then
+              echo "  Triggered (HTTP $RH)"
+              local JL=$(grep -i "^location:" /tmp/run_h.txt | tr -d '\r' | awk '{print $2}')
+              if [ -n "$JL" ]; then
+                for a in $(seq 1 40); do
+                  sleep 30
+                  local FULL_RESP=$(curl -s -H "Authorization: Bearer $TK" "$JL")
+                  local JS=$(echo "$FULL_RESP" | jq -r '.status // empty')
+                  echo "    Poll $a/40: $JS"
+                  if [ "$JS" = "Completed" ]; then echo "  COMPLETED"; rm -f /tmp/run_h.txt; return 0; fi
+                  if [ "$JS" = "Failed" ] || [ "$JS" = "Cancelled" ]; then
+                    echo "  $JS"
+                    echo "$FULL_RESP" | jq '.' 2>/dev/null || echo "$FULL_RESP"
+                    rm -f /tmp/run_h.txt; return 1
+                  fi
+                done
+                echo "  Timed out (20 min)"; rm -f /tmp/run_h.txt; return 1
+              else echo "  No Location header"; rm -f /tmp/run_h.txt; return 1; fi
+            else echo "  Trigger HTTP $RH — FAILED"; rm -f /tmp/run_h.txt; return 1; fi
+          }
+          
+          # ── Run each performance notebook ──
+          NOTEBOOKS=("notebooks/04_bpa_analyzer.py" "notebooks/05_memory_analyzer.py" "notebooks/06_compression_analyzer.py")
+          NB_NAMES=("04_bpa_analyzer" "05_memory_analyzer" "06_compression_analyzer")
+          RESULTS=()
+          
+          for i in "${!NOTEBOOKS[@]}"; do
+            NB_FILE="${NOTEBOOKS[$i]}"
+            NB_NAME="${NB_NAMES[$i]}"
+            echo ""
+            echo "============================================"
+            echo "  NOTEBOOK: $NB_NAME"
+            echo "============================================"
+            
+            NB_ID=$(upload_or_update_notebook "$NB_FILE" "$NB_NAME" "$WS_ID" "$FABRIC_TOKEN")
+            if [ -z "$NB_ID" ]; then
+              echo "::warning::Failed to upload $NB_NAME — skipping"
+              RESULTS+=("$NB_NAME:SKIP")
+              continue
+            fi
+            
+            if run_and_poll "$NB_ID" "$WS_ID" "$FABRIC_TOKEN" "$NB_NAME"; then
+              RESULTS+=("$NB_NAME:PASS")
+            else
+              RESULTS+=("$NB_NAME:FAIL")
+            fi
+          done
+          
+          # ── Summary ──
+          echo ""
+          echo "============================================"
+          echo "  RUNTIME ANALYSIS SUMMARY"
+          echo "============================================"
+          FAIL_COUNT=0
+          for r in "${RESULTS[@]}"; do
+            NB=$(echo "$r" | cut -d: -f1)
+            STATUS=$(echo "$r" | cut -d: -f2)
+            if [ "$STATUS" = "FAIL" ]; then
+              echo "  FAIL  $NB"
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+            elif [ "$STATUS" = "SKIP" ]; then
+              echo "  SKIP  $NB"
+            else
+              echo "  PASS  $NB"
+            fi
+          done
+          echo "============================================"
+          
+          if [ "$FAIL_COUNT" -gt "0" ]; then
+            echo "::warning::$FAIL_COUNT notebook(s) failed — review performance issues"
+          fi
+
+      - name: Read diagnostic reports from OneLake
+        if: always()
+        run: |
+          echo "Reading diagnostic reports from OneLake..."
+          
+          # Find lakehouses in the workspace
+          LH_LIST=$(curl -s -H "Authorization: Bearer $FABRIC_TOKEN" \
+            "https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/lakehouses" 2>/dev/null || echo '{}')
+          LH_ID=$(echo "$LH_LIST" | jq -r '.value[0].id // empty' 2>/dev/null)
+          
+          if [ -z "$LH_ID" ] || [ -z "$STORAGE_TOKEN" ] || [ "$STORAGE_TOKEN" = "null" ]; then
+            echo "  Cannot read OneLake reports (no lakehouse or storage token)"
+            exit 0
+          fi
+          
+          echo "  Lakehouse: $LH_ID"
+          
+          # List diagnostics files
+          DIAG_FILES=$(curl -s \
+            -H "Authorization: Bearer $STORAGE_TOKEN" \
+            -H "x-ms-version: 2023-01-03" \
+            "https://onelake.dfs.fabric.microsoft.com/$WS_ID/$LH_ID?resource=filesystem&directory=Files/diagnostics&recursive=true" 2>/dev/null || echo '{}')
+          
+          echo "  Diagnostics files found:"
+          echo "$DIAG_FILES" | python3 -c "
+          import json, sys
+          try:
+              data = json.load(sys.stdin)
+              paths = data.get('paths', [])
+              for p in paths:
+                  print(f\"    {p.get('name', '')}  ({p.get('contentLength', 0)} bytes)\")
+              if not paths:
+                  print('    (none)')
+          except: print('    (could not parse)')
+          " 2>/dev/null || echo "    (could not list)"
+
+  # Job 4: Combined Gate Decision
   gate-decision:
     name: Performance Gate Decision
     needs: [tmdl-lint, schema-check]
@@ -158,12 +387,12 @@ jobs:
           echo "============================================"
           echo "  PERFORMANCE GATE RESULTS"
           echo "============================================"
-          echo "  TMDL Anti-Pattern Scan:  ✓ PASSED"
-          echo "  Schema Validation:       ✓ PASSED"
+          echo "  TMDL Anti-Pattern Scan:  PASSED"
+          echo "  Schema Validation:       PASSED"
           echo "============================================"
           echo ""
-          echo "  All gates passed. Safe to deploy."
+          echo "  Static gates passed. Safe to deploy."
           echo ""
-          echo "  Note: Runtime checks (BPA via semantic-link-labs,"
-          echo "  Memory Analyzer, Compression Analyzer) run"
-          echo "  post-deploy in the Fabric notebook pipeline."
+          echo "  Runtime checks (BPA, Memory, Compression)"
+          echo "  run via the runtime-analysis job when"
+          echo "  triggered manually or with 'run-perf' label."

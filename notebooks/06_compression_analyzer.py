@@ -24,15 +24,25 @@ from pyspark.sql.types import StructType
 
 LAKEHOUSE_NAME = "DigitalRealty_Capacity"
 
-TABLES = [
-    "bronze_datacenters",
-    "bronze_power_capacity",
-    "bronze_customer_deployments",
-    "silver_datacenter_capacity",
-    "silver_customer_analytics",
-    "silver_power_efficiency",
-    "silver_regional_summary",
-]
+# Dynamically discover ALL tables in the lakehouse — zero hardcoded values
+try:
+    _all_tables = spark.catalog.listTables()
+    TABLES = [t.name for t in _all_tables if not t.name.startswith("_") and t.isTemporary is False]
+    print(f"Discovered {len(TABLES)} tables dynamically via spark.catalog.listTables()")
+except Exception as _disc_err:
+    # Fallback: try spark.sql SHOW TABLES
+    try:
+        _rows = spark.sql("SHOW TABLES").collect()
+        TABLES = [r["tableName"] for r in _rows if not r["tableName"].startswith("_")]
+        print(f"Discovered {len(TABLES)} tables via SHOW TABLES (fallback)")
+    except Exception as _show_err:
+        print(f"WARNING: Table discovery failed: {_disc_err} / {_show_err}")
+        TABLES = []
+
+if not TABLES:
+    print("No tables found -- nothing to analyze")
+else:
+    print(f"Tables to analyze: {TABLES}")
 
 SMALL_FILE_THRESHOLD_MB = 32   # files smaller than this are "small"
 TARGET_FILE_SIZE_MB = 128
@@ -356,16 +366,21 @@ for table in TABLES:
 
 # COMMAND ----------
 
-# Columns commonly used for filtering in Digital Realty workloads
-ZORDER_CANDIDATES = {
-    "bronze_datacenters": [],
-    "bronze_power_capacity": ["datacenter_id", "measurement_date"],
-    "bronze_customer_deployments": ["datacenter_id"],
-    "silver_datacenter_capacity": ["datacenter_id", "region"],
-    "silver_customer_analytics": ["datacenter_id", "customer_id"],
-    "silver_power_efficiency": ["datacenter_id", "measurement_date"],
-    "silver_regional_summary": ["region"],
-}
+# Dynamically infer ZORDER candidates: columns commonly used in filters/joins
+# Heuristic: columns with 'id', 'date', 'region', 'key' in the name are good ZORDER choices
+def _infer_zorder_candidates(table_name):
+    """Infer ZORDER columns from table schema — no hardcoded values."""
+    try:
+        schema = spark.table(table_name).schema
+        candidates = []
+        for field in schema.fields:
+            name_lower = field.name.lower()
+            if any(kw in name_lower for kw in ['_id', '_date', 'region', '_key', 'datacenter_id', 'customer_id']):
+                candidates.append(field.name)
+        # Limit to 3 ZORDER columns (diminishing returns beyond that)
+        return candidates[:3]
+    except Exception:
+        return []
 
 print("-- ==============================================")
 print("-- Recommended OPTIMIZE Commands")
@@ -389,7 +404,7 @@ for table in TABLES:
         or num_files > max(1, int(size_mb / TARGET_FILE_SIZE_MB) + 1) * 2
     )
 
-    zorder_cols = ZORDER_CANDIDATES.get(table, [])
+    zorder_cols = _infer_zorder_candidates(table)
     # Validate that ZORDER columns actually exist in the table
     try:
         actual_cols = [f.name for f in spark.table(table).schema.fields]
