@@ -762,6 +762,15 @@ jobs:
           # ════════════════════════════════════════════════════════════════════
           LH_OK=0; LH_FAIL=0; LH_SKIP=0
 
+          # Cache storage token for status marker reading
+          STORAGE_TOKEN_CACHED=$(curl -s -X POST \
+            "https://login.microsoftonline.com/${{ secrets.FABRIC_TENANT_ID }}/oauth2/v2.0/token" \
+            -d "client_id=${{ secrets.FABRIC_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.FABRIC_CLIENT_SECRET }}" \
+            -d "scope=https://storage.azure.com/.default" \
+            -d "grant_type=client_credentials" | jq -r '.access_token // empty')
+          echo "Storage token cached: $([ -n "$STORAGE_TOKEN_CACHED" ] && echo 'yes' || echo 'no')"
+
           for i in $(seq 0 $((LAKEHOUSE_COUNT - 1))); do
             echo ""
             echo "================================================================"
@@ -849,6 +858,25 @@ jobs:
             else
               echo "  Lakehouse $LH_NAME: FAILED"
               LH_FAIL=$((LH_FAIL + 1))
+            fi
+
+            # Read sync status marker from OneLake (if available)
+            if [ -n "$STORAGE_TOKEN_CACHED" ]; then
+              echo "  Reading sync status marker..."
+              STATUS_JSON=$(curl -s \
+                -H "Authorization: Bearer $STORAGE_TOKEN_CACHED" \
+                -H "x-ms-version: 2023-01-03" \
+                "https://onelake.dfs.fabric.microsoft.com/$WS_ID/$UAT_LH_ID/Tables/___sync_status.json" 2>/dev/null || true)
+              if echo "$STATUS_JSON" | jq -e '.status' >/dev/null 2>&1; then
+                echo "  ---- SYNC STATUS MARKER ----"
+                echo "$STATUS_JSON" | jq '.'
+                SYN_OK=$(echo "$STATUS_JSON" | jq -r '.tables_synced | length // 0')
+                SYN_FAIL=$(echo "$STATUS_JSON" | jq -r '.tables_failed | length // 0')
+                echo "  Synced: $SYN_OK  Failed: $SYN_FAIL"
+                echo "  ----------------------------"
+              else
+                echo "  (no status marker found)"
+              fi
             fi
             rm -f /tmp/nb_payload.json
           done

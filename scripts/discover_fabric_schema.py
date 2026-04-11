@@ -40,8 +40,12 @@ Output (schema_discovery.json):
 import os
 import json
 import sys
+import re
 import urllib.request
 import urllib.error
+
+# Clone tables created by Fabric (e.g. green_tripdata_2017_clone_20260408)
+_CLONE_RE = re.compile(r"_clone_\d{6,}")
 
 FABRIC_TOKEN   = os.environ.get("FABRIC_TOKEN", "")
 STORAGE_TOKEN  = os.environ.get("STORAGE_TOKEN", "")
@@ -199,8 +203,14 @@ def _list_tables_recursive(ws_id, lh_id):
             if len(parts) == 2:
                 schema, table = parts
                 if schema not in _NON_SCHEMA_DIRS and table not in _NON_SCHEMA_DIRS:
+                    if _CLONE_RE.search(table):
+                        print(f"    Filtered clone: {schema}.{table}")
+                        continue
                     results.append((schema, table))
             elif len(parts) == 1 and parts[0] not in _NON_SCHEMA_DIRS:
+                if _CLONE_RE.search(parts[0]):
+                    print(f"    Filtered clone: {parts[0]}")
+                    continue
                 results.append(("", parts[0]))
 
         print(f"  Recursive DFS: {len(results)} table(s) found across {len(set(r[0] for r in results))} schema(s)")
@@ -250,6 +260,7 @@ def list_all_schemas_and_tables(ws_id, lh_id):
         sub_tables = [
             t for t in sub_tables
             if t["name"] not in _NON_SCHEMA_DIRS and not t["name"].startswith("_")
+            and not _CLONE_RE.search(t["name"])
         ]
         if sub_tables:
             schema_tables[sname] = [t["name"] for t in sub_tables]
@@ -421,6 +432,9 @@ for candidate in candidates:
         for t in tbl_list:
             tname = t.get("name", "")
             if not tname or tname in _NON_SCHEMA_DIRS or tname.startswith("_"):
+                continue
+            if _CLONE_RE.search(tname):
+                print(f"    Filtered clone table: {tname}")
                 continue
             delta_path = f"Tables/{tname}/_delta_log/00000000000000000000.json"
             content = onelake_read(WORKSPACE_ID, cid, delta_path)
