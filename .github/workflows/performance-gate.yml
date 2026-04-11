@@ -137,6 +137,16 @@ jobs:
           echo "PASS_COUNT=0" > /tmp/gate_counters.txt
           echo "WARN_COUNT=0" >> /tmp/gate_counters.txt
           echo "FAIL_COUNT=0" >> /tmp/gate_counters.txt
+          # Per-category counters for the verdict breakdown table
+          echo "PERF_PASS=0" >> /tmp/gate_counters.txt
+          echo "PERF_WARN=0" >> /tmp/gate_counters.txt
+          echo "PERF_FAIL=0" >> /tmp/gate_counters.txt
+          echo "SEC_PASS=0" >> /tmp/gate_counters.txt
+          echo "SEC_WARN=0" >> /tmp/gate_counters.txt
+          echo "SEC_FAIL=0" >> /tmp/gate_counters.txt
+          echo "GOV_PASS=0" >> /tmp/gate_counters.txt
+          echo "GOV_WARN=0" >> /tmp/gate_counters.txt
+          echo "GOV_FAIL=0" >> /tmp/gate_counters.txt
 
           # Export variables for subsequent steps
           echo "TMDL_LIST=$TMDL_LIST" >> $GITHUB_ENV
@@ -151,6 +161,9 @@ jobs:
           set +e
           REPORT="$GITHUB_STEP_SUMMARY"
           source /tmp/gate_counters.txt
+          OLD_PASS=$PASS_COUNT
+          OLD_WARN=$WARN_COUNT
+          OLD_FAIL=$FAIL_COUNT
 
           # ════════════════════════════════════════════════════════════
           # CHECK 1/11: CALCULATED COLUMNS
@@ -197,21 +210,34 @@ jobs:
 
           **Recommendation:** Convert calculated columns to DAX measures. Measures compute at query time without forcing DirectQuery.
 
-          <details><summary>Before / After</summary>
-
-          **Before (anti-pattern):**
-          ```
-            calculatedColumn calc_deployment_age = DATEDIFF(...)
-          ```
-
-          **After (optimized):**
-          ```
-            measure 'Deployment Age' = DATEDIFF(...)
-              formatString: #,##0
-          ```
-          </details>
+          > **NOTE:** The Before/After examples below are **RECOMMENDATIONS** — the workflow does not automatically apply these changes. You must implement them manually in your TMDL files.
 
           RECEOF
+            # Show real Before/After for each actual calculated column found
+            grep -n "calculatedColumn" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null | while IFS= read -r line; do
+              FILE=$(echo "$line" | cut -d: -f1)
+              LINENO_VAL=$(echo "$line" | cut -d: -f2)
+              CODE=$(echo "$line" | cut -d: -f3- | xargs)
+              COL_NAME=$(echo "$CODE" | sed 's/calculatedColumn //' | sed 's/ =.*//')
+              EXPR=$(echo "$CODE" | sed 's/.*= //')
+              {
+                echo "<details><summary>Finding: <code>$COL_NAME</code> in $FILE line $LINENO_VAL</summary>"
+                echo ""
+                echo "**Before (current anti-pattern in your model):**"
+                echo '```'
+                echo "  $CODE"
+                echo '```'
+                echo "**After (recommended — convert to measure):**"
+                echo '```'
+                echo "  measure '$COL_NAME' = $EXPR"
+                echo "    formatString: #,##0"
+                echo '```'
+                echo "**Impact:** This calculated column materializes a new column for every row, bloating model size and forcing DirectLake to fall back to DirectQuery (10-100x slower). A measure computes on-demand at query time with zero storage cost."
+                echo ""
+                echo "</details>"
+                echo ""
+              } >> "$REPORT"
+            done
           else
             echo "  No calculated columns found."
             echo "  VERDICT: PASS"
@@ -268,11 +294,29 @@ jobs:
 
           | Pattern | Count | Impact | Recommendation |
           |---------|-------|--------|----------------|
-          | \`SUMX()\` | $SUMX_COUNT | Row-by-row iteration | Replace with \`SUM()\` where possible |
-          | \`FILTER(ALL())\` | $FILTER_ALL | Breaks filter context | Use \`CALCULATE + REMOVEFILTERS\` |
-          | \`AVERAGEX()\` | $AVERAGEX_COUNT | Row iteration | Replace with \`AVERAGE()\` |
+          | \`SUMX()\` | $SUMX_COUNT | Row-by-row iteration instead of bulk — uses 3-10x more memory | Replace with \`SUM()\` where possible |
+          | \`FILTER(ALL())\` | $FILTER_ALL | Breaks filter context, can return wrong results and forces full table scan | Use \`CALCULATE + REMOVEFILTERS\` |
+          | \`AVERAGEX()\` | $AVERAGEX_COUNT | Iterates every row to compute average — slow on large tables | Replace with \`AVERAGE()\` |
 
           EOF
+            # Detailed findings table with file:line for each anti-pattern
+            echo "**Detailed Findings:**" >> "$REPORT"
+            echo "" >> "$REPORT"
+            echo "| File | Line | Pattern | Code |" >> "$REPORT"
+            echo "|------|------|---------|------|" >> "$REPORT"
+            for pat_label in "SUMX(|SUMX(" "FILTER(ALL(|FILTER(ALL(" "AVERAGEX(|AVERAGEX("; do
+              LABEL=$(echo "$pat_label" | cut -d'|' -f1)
+              PAT=$(echo "$pat_label" | cut -d'|' -f2)
+              grep -n "$PAT" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null | while IFS= read -r line; do
+                FILE=$(echo "$line" | cut -d: -f1)
+                LINENO_VAL=$(echo "$line" | cut -d: -f2)
+                CODE=$(echo "$line" | cut -d: -f3- | sed 's/|/\\|/g' | xargs)
+                echo "| \`$FILE\` | $LINENO_VAL | \`$LABEL\` | \`$CODE\` |" >> "$REPORT"
+              done
+            done
+            echo "" >> "$REPORT"
+            echo "> **NOTE:** The Before/After examples below are **RECOMMENDATIONS** — the workflow does not automatically apply these changes. You must implement them manually in your TMDL files." >> "$REPORT"
+            echo "" >> "$REPORT"
             if [ "$FILTER_ALL" -gt "0" ]; then
               cat >> "$REPORT" << 'DAXEOF'
           <details><summary>Before / After — FILTER(ALL) fix</summary>
@@ -293,9 +337,28 @@ jobs:
               table[risk] = "High"
           )
           ```
+          **Why this matters:** `FILTER(ALL())` creates a full copy of the table in memory, then iterates row-by-row to apply the filter. `REMOVEFILTERS` + direct filter is engine-optimized and uses a fraction of the memory.
           </details>
 
           DAXEOF
+            fi
+            if [ "$SUMX_COUNT" -gt "0" ]; then
+              cat >> "$REPORT" << 'SUMXEOF'
+          <details><summary>Before / After — SUMX fix</summary>
+
+          **Before (anti-pattern):**
+          ```dax
+          measure 'Total Revenue' = SUMX(table, table[column])
+          ```
+
+          **After (optimized):**
+          ```dax
+          measure 'Total Revenue' = SUM(table[column])
+          ```
+          **Why this matters:** `SUMX` is a row iterator — it touches every row individually. `SUM` is a bulk aggregation that the engine can parallelize and optimize with columnar storage. On large tables, SUM can be 10-50x faster.
+          </details>
+
+          SUMXEOF
             fi
           else
             echo "  VERDICT: PASS"
@@ -365,13 +428,25 @@ jobs:
           echo "============================================================"
           BLOAT_TOTAL=0
           BLOAT_DETAIL=""
+          BLOAT_FINDINGS=""
           for p in description notes raw_ _hash _etl_ response; do
-            C=$(grep -i "$p" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null | wc -l)
-            echo "  Pattern '$p': $C matches"
+            # Only match column definitions (not TMDL description: attributes)
+            HITS=$(grep -in "column.*$p" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null | grep -v "^\s*description:" || true)
+            C=0
+            [ -n "$HITS" ] && C=$(echo "$HITS" | wc -l)
+            echo "  Pattern '$p' (column names only): $C matches"
             if [ "$C" -gt "0" ]; then
-              grep -in "$p" $(cat "$TMDL_LIST" | tr "\n" " ") 2>/dev/null | head -3 | while IFS= read -r line; do echo "    [HIT] $line"; done
+              echo "$HITS" | head -3 | while IFS= read -r line; do echo "    [HIT] $line"; done
               BLOAT_TOTAL=$((BLOAT_TOTAL + C))
               BLOAT_DETAIL="$BLOAT_DETAIL| \`$p\` | $C |\n"
+              # Build detailed findings for the report
+              while IFS= read -r line; do
+                FILE=$(echo "$line" | cut -d: -f1)
+                LINENO_VAL=$(echo "$line" | cut -d: -f2)
+                CODE=$(echo "$line" | cut -d: -f3- | sed 's/|/\\|/g' | xargs)
+                COL_NAME=$(echo "$CODE" | grep -oP "column\s+\K\S+" || echo "$CODE")
+                BLOAT_FINDINGS="$BLOAT_FINDINGS| \`$FILE\` | $LINENO_VAL | \`$COL_NAME\` | \`$p\` |\n"
+              done <<< "$HITS"
             fi
           done
           echo ""
@@ -383,13 +458,21 @@ jobs:
             cat >> "$REPORT" << EOF
           ### :warning: CHECK 4: High-Cardinality Bloat Columns — $BLOAT_TOTAL matches
 
-          **Severity:** Medium | **Impact:** Text columns with high cardinality inflate model size and slow refresh
+          **Severity:** Medium | **Impact:** Text columns with high cardinality inflate model size and slow refresh. Each unique text value consumes dictionary memory.
+
+          **Pattern Summary:**
 
           | Pattern | Occurrences |
           |---------|-------------|
           $(echo -e "$BLOAT_DETAIL")
 
-          **Recommendation:** Remove or archive text columns not needed for analysis. Use hash keys instead of full text.
+          **Detailed Findings (column definitions only — TMDL metadata attributes excluded):**
+
+          | File | Line | Column Name | Pattern |
+          |------|------|-------------|---------|
+          $(echo -e "$BLOAT_FINDINGS")
+
+          **Recommendation:** Remove or archive text columns not needed for analysis. If a column is only used for display (not filtering or grouping), consider hiding it or moving it to a separate detail table to reduce the main model's memory footprint.
 
           EOF
           else
@@ -471,6 +554,13 @@ jobs:
           echo "PASS_COUNT=$PASS_COUNT" > /tmp/gate_counters.txt
           echo "WARN_COUNT=$WARN_COUNT" >> /tmp/gate_counters.txt
           echo "FAIL_COUNT=$FAIL_COUNT" >> /tmp/gate_counters.txt
+          # Per-category: performance checks (1-5)
+          PERF_PASS=$((PASS_COUNT - OLD_PASS))
+          PERF_WARN=$((WARN_COUNT - OLD_WARN))
+          PERF_FAIL=$((FAIL_COUNT - OLD_FAIL))
+          echo "PERF_PASS=$PERF_PASS" >> /tmp/gate_counters.txt
+          echo "PERF_WARN=$PERF_WARN" >> /tmp/gate_counters.txt
+          echo "PERF_FAIL=$PERF_FAIL" >> /tmp/gate_counters.txt
 
           # Export check variables for Verdict step
           echo "FILTER_ALL=$FILTER_ALL" >> $GITHUB_ENV
@@ -482,6 +572,9 @@ jobs:
           set +e
           REPORT="$GITHUB_STEP_SUMMARY"
           source /tmp/gate_counters.txt
+          OLD_PASS=$PASS_COUNT
+          OLD_WARN=$WARN_COUNT
+          OLD_FAIL=$FAIL_COUNT
 
           # ════════════════════════════════════════════════════════════
           # CHECK 6/11: ROW-LEVEL SECURITY (RLS) COVERAGE
@@ -738,6 +831,17 @@ jobs:
           echo "PASS_COUNT=$PASS_COUNT" > /tmp/gate_counters.txt
           echo "WARN_COUNT=$WARN_COUNT" >> /tmp/gate_counters.txt
           echo "FAIL_COUNT=$FAIL_COUNT" >> /tmp/gate_counters.txt
+          # Per-category: security checks (6-9)
+          SEC_PASS=$((PASS_COUNT - OLD_PASS))
+          SEC_WARN=$((WARN_COUNT - OLD_WARN))
+          SEC_FAIL=$((FAIL_COUNT - OLD_FAIL))
+          echo "SEC_PASS=$SEC_PASS" >> /tmp/gate_counters.txt
+          echo "SEC_WARN=$SEC_WARN" >> /tmp/gate_counters.txt
+          echo "SEC_FAIL=$SEC_FAIL" >> /tmp/gate_counters.txt
+          # Carry forward performance per-category from earlier step
+          echo "PERF_PASS=${PERF_PASS:-0}" >> /tmp/gate_counters.txt
+          echo "PERF_WARN=${PERF_WARN:-0}" >> /tmp/gate_counters.txt
+          echo "PERF_FAIL=${PERF_FAIL:-0}" >> /tmp/gate_counters.txt
 
           # Export check variables for Verdict step
           echo "RLS_EXPOSED=$RLS_EXPOSED" >> $GITHUB_ENV
@@ -749,6 +853,9 @@ jobs:
           set +e
           REPORT="$GITHUB_STEP_SUMMARY"
           source /tmp/gate_counters.txt
+          OLD_PASS=$PASS_COUNT
+          OLD_WARN=$WARN_COUNT
+          OLD_FAIL=$FAIL_COUNT
 
           # ════════════════════════════════════════════════════════════
           # CHECK 10/11: DESCRIPTION COVERAGE
@@ -788,13 +895,35 @@ jobs:
           | With description | $DESC_DESCS |
           | **Undocumented** | **$DESC_GAP** |
 
-          **Recommendation:** Add \`description:\` to every measure. Example:
-          \`\`\`
+          EOF
+            # List each undocumented measure by name with file + line
+            # A measure is "undocumented" if the next non-blank line is NOT description:
+            echo "**Undocumented measures (missing \`description:\` attribute):**" >> "$REPORT"
+            echo "" >> "$REPORT"
+            echo "| File | Line | Measure Name |" >> "$REPORT"
+            echo "|------|------|-------------|" >> "$REPORT"
+            UNDOC_LISTED=0
+            for f in $(cat "$TMDL_LIST"); do
+              grep -n "measure " "$f" 2>/dev/null | while IFS= read -r mline; do
+                MLINENO=$(echo "$mline" | cut -d: -f1)
+                MCODE=$(echo "$mline" | cut -d: -f2-)
+                MNAME=$(echo "$MCODE" | grep -oP "measure\s+'\K[^']+|measure\s+\K\S+" || echo "?")
+                # Check if next non-blank line after measure is description:
+                NEXT_LINE=$(awk "NR>$MLINENO && NF{print;exit}" "$f" 2>/dev/null)
+                if ! echo "$NEXT_LINE" | grep -q "description:"; then
+                  echo "| \`$f\` | $MLINENO | \`$MNAME\` |" >> "$REPORT"
+                fi
+              done
+            done
+            echo "" >> "$REPORT"
+            cat >> "$REPORT" << 'DESCEOF'
+          **Recommendation:** Add `description:` to every measure. Example:
+          ```
             measure 'Total Revenue' = SUM(...)
               description: "Sum of monthly revenue across all active deployments"
-          \`\`\`
+          ```
 
-          EOF
+          DESCEOF
           else
             echo "  VERDICT: PASS (gap $DESC_GAP within threshold of 3)"
             PASS_COUNT=$((PASS_COUNT + 1))
@@ -863,6 +992,21 @@ jobs:
           echo "PASS_COUNT=$PASS_COUNT" > /tmp/gate_counters.txt
           echo "WARN_COUNT=$WARN_COUNT" >> /tmp/gate_counters.txt
           echo "FAIL_COUNT=$FAIL_COUNT" >> /tmp/gate_counters.txt
+          # Per-category: governance checks (10-11)
+          GOV_PASS=$((PASS_COUNT - OLD_PASS))
+          GOV_WARN=$((WARN_COUNT - OLD_WARN))
+          GOV_FAIL=$((FAIL_COUNT - OLD_FAIL))
+          echo "GOV_PASS=$GOV_PASS" >> /tmp/gate_counters.txt
+          echo "GOV_WARN=$GOV_WARN" >> /tmp/gate_counters.txt
+          echo "GOV_FAIL=$GOV_FAIL" >> /tmp/gate_counters.txt
+
+          # Carry forward per-category from earlier steps
+          echo "PERF_PASS=${PERF_PASS:-0}" >> /tmp/gate_counters.txt
+          echo "PERF_WARN=${PERF_WARN:-0}" >> /tmp/gate_counters.txt
+          echo "PERF_FAIL=${PERF_FAIL:-0}" >> /tmp/gate_counters.txt
+          echo "SEC_PASS=${SEC_PASS:-0}" >> /tmp/gate_counters.txt
+          echo "SEC_WARN=${SEC_WARN:-0}" >> /tmp/gate_counters.txt
+          echo "SEC_FAIL=${SEC_FAIL:-0}" >> /tmp/gate_counters.txt
 
           # Export check variables for Verdict step
           echo "DESC_GAP=$DESC_GAP" >> $GITHUB_ENV
@@ -913,11 +1057,22 @@ jobs:
 
           ### $HEALTH_ICON Model Health Score: $HEALTH / 100 — $HEALTH_LABEL
 
+          **How this score was calculated:**
+
+          \`\`\`
+          Health = 100 - (FAILs x 20) - (WARNs x 5)
+                = 100 - ($FAIL_COUNT x 20) - ($WARN_COUNT x 5)
+                = 100 - $((FAIL_COUNT * 20)) - $((WARN_COUNT * 5))
+                = $HEALTH
+          \`\`\`
+
+          Each FAIL deducts 20 points (critical issues). Each WARN deducts 5 points (improvements needed). Score >= 80 = Good, >= 50 = Needs Improvement, < 50 = At Risk.
+
           | Category | Checks | :white_check_mark: Pass | :warning: Warn | :x: Fail |
           |----------|--------|------|------|------|
-          | Performance | 5 | - | - | - |
-          | Security | 4 | - | - | - |
-          | Governance | 2 | - | - | - |
+          | Performance (1-5) | 5 | $PERF_PASS | $PERF_WARN | $PERF_FAIL |
+          | Security (6-9) | 4 | $SEC_PASS | $SEC_WARN | $SEC_FAIL |
+          | Governance (10-11) | 2 | $GOV_PASS | $GOV_WARN | $GOV_FAIL |
           | **Total** | **$TOTAL** | **$PASS_COUNT** | **$WARN_COUNT** | **$FAIL_COUNT** |
 
           ### Top Recommendations
