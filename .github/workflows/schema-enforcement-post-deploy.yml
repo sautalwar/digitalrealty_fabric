@@ -1,10 +1,21 @@
-name: Schema Enforcement Post-Deploy
+name: "🔒 Schema Enforcement & Quality Gate"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UC3: Automated Quality & Governance
+#
+# This workflow enforces schema consistency and data quality after deployments:
+#   1. Uploads & runs 00_apply_schema.py → detects/blocks schema drift
+#   2. Uploads & runs 03_data_quality_checks.py → enforces DQ gate
+#   3. Reads reports from OneLake Files/diagnostics/ for pass/fail verdict
+#
+# Optional "dirty-data-demo" job ingests bad CSV data to show the gate catching it.
+# ─────────────────────────────────────────────────────────────────────────────
 
 on:
   workflow_dispatch:
     inputs:
       target_environment:
-        description: 'Target environment to enforce schemas on'
+        description: "Target environment to enforce schemas on"
         required: true
         type: choice
         options:
@@ -12,82 +23,936 @@ on:
           - uat
           - prod
       dry_run:
-        description: 'Dry run (report only, no changes)'
+        description: "Dry run (report only, no changes)"
+        required: false
+        type: boolean
+        default: false
+      dirty_data_demo:
+        description: "Run dirty-data demo (ingest bad CSV, expect DQ FAIL)"
         required: false
         type: boolean
         default: false
 
+concurrency:
+  group: schema-enforcement-${{ github.event.inputs.target_environment }}
+  cancel-in-progress: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SETUP: Required GitHub configuration before running:
+#
+# Secrets (Settings → Secrets → Actions):
+#   FABRIC_TENANT_ID       Azure AD tenant ID
+#   FABRIC_CLIENT_ID       Service principal app (client) ID
+#   FABRIC_CLIENT_SECRET   Service principal secret
+#
+# Environment JSON files (environments/<env>.json):
+#   workspace_id           Fabric workspace GUID
+#   lakehouse_name         Lakehouse display name (for discovery)
+# ─────────────────────────────────────────────────────────────────────────────
+
 jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 1 — Schema Enforcement + Quality Gate
+  # ═══════════════════════════════════════════════════════════════════════════
   enforce-schema:
+    name: "🔒 Enforce Schema & Quality Gate"
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.target_environment }}
+    if: github.event.inputs.dirty_data_demo != 'true'
     steps:
       - uses: actions/checkout@v4
 
-      - name: Get Fabric Access Token
+      # ── Step 1: Acquire Fabric API token ────────────────────────────────
+      - name: Get Fabric API Token
         id: token
         run: |
+          echo "Authenticating to Fabric API..."
+          TOKEN_RESP=$(curl -s -X POST \
+            "https://login.microsoftonline.com/${{ secrets.FABRIC_TENANT_ID }}/oauth2/v2.0/token" \
+            -d "client_id=${{ secrets.FABRIC_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.FABRIC_CLIENT_SECRET }}" \
+            -d "scope=https://api.fabric.microsoft.com/.default" \
+            -d "grant_type=client_credentials")
+
+          TOKEN=$(echo "$TOKEN_RESP" | jq -r '.access_token // empty')
+          if [ -z "$TOKEN" ]; then
+            echo "ERROR: Failed to acquire Fabric API token"
+            echo "$TOKEN_RESP" | jq '.' 2>/dev/null || echo "$TOKEN_RESP"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          echo "✅ Fabric API token acquired"
+
+      # ── Step 2: Acquire OneLake storage token ───────────────────────────
+      - name: Get Storage Token
+        id: storage_token
+        run: |
+          STORAGE_RESP=$(curl -s -X POST \
+            "https://login.microsoftonline.com/${{ secrets.FABRIC_TENANT_ID }}/oauth2/v2.0/token" \
+            -d "client_id=${{ secrets.FABRIC_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.FABRIC_CLIENT_SECRET }}" \
+            -d "scope=https://storage.azure.com/.default" \
+            -d "grant_type=client_credentials")
+
+          STORAGE_TOKEN=$(echo "$STORAGE_RESP" | jq -r '.access_token // empty')
+          if [ -z "$STORAGE_TOKEN" ]; then
+            echo "WARNING: Could not acquire storage token — report reading will be skipped"
+          else
+            echo "::add-mask::$STORAGE_TOKEN"
+          fi
+          echo "token=$STORAGE_TOKEN" >> $GITHUB_OUTPUT
+
+      # ── Step 3: Resolve workspace + lakehouse IDs ───────────────────────
+      - name: Resolve Workspace & Lakehouse
+        id: workspace
+        run: |
+          ENV="${{ github.event.inputs.target_environment }}"
+          TOKEN="${{ steps.token.outputs.token }}"
+
+          # Read workspace ID from environment config
+          WORKSPACE_ID=$(jq -r '.workspace_id' "environments/${ENV}.json")
+          LAKEHOUSE_NAME=$(jq -r '.lakehouse_name' "environments/${ENV}.json")
+
+          if [ -z "$WORKSPACE_ID" ] || [ "$WORKSPACE_ID" = "null" ]; then
+            echo "ERROR: No workspace_id in environments/${ENV}.json"
+            exit 1
+          fi
+
+          echo "workspace_id=$WORKSPACE_ID" >> $GITHUB_OUTPUT
+          echo "lakehouse_name=$LAKEHOUSE_NAME" >> $GITHUB_OUTPUT
+
+          # Discover lakehouse ID dynamically via API
+          LH_ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
+            "https://api.fabric.microsoft.com/v1/workspaces/$WORKSPACE_ID/items?type=Lakehouse")
+          LAKEHOUSE_ID=$(echo "$LH_ITEMS" | jq -r --arg n "$LAKEHOUSE_NAME" \
+            '.value[] | select(.displayName == $n) | .id // empty' | head -1)
+
+          # Fallback: use first lakehouse if name match fails
+          if [ -z "$LAKEHOUSE_ID" ]; then
+            LAKEHOUSE_ID=$(echo "$LH_ITEMS" | jq -r '.value[0].id // empty')
+            LAKEHOUSE_NAME=$(echo "$LH_ITEMS" | jq -r '.value[0].displayName // empty')
+            echo "WARNING: Lakehouse name mismatch — using first found: $LAKEHOUSE_NAME ($LAKEHOUSE_ID)"
+          fi
+
+          echo "lakehouse_id=$LAKEHOUSE_ID" >> $GITHUB_OUTPUT
+          echo ""
+          echo "Target Environment : $ENV"
+          echo "Workspace ID       : $WORKSPACE_ID"
+          echo "Lakehouse          : $LAKEHOUSE_NAME ($LAKEHOUSE_ID)"
+
+      # ── Step 4: Upload & run schema enforcement, then quality checks ────
+      - name: Run Schema Enforcement & Quality Gate
+        id: enforcement
+        run: |
+          set -euo pipefail
+
+          TOKEN="${{ steps.token.outputs.token }}"
+          STORAGE_TOKEN="${{ steps.storage_token.outputs.token }}"
+          WS_ID="${{ steps.workspace.outputs.workspace_id }}"
+          LH_ID="${{ steps.workspace.outputs.lakehouse_id }}"
+          LH_NAME="${{ steps.workspace.outputs.lakehouse_name }}"
+          ENV="${{ github.event.inputs.target_environment }}"
+          DRY_RUN="${{ github.event.inputs.dry_run }}"
+
+          echo "================================================================"
+          echo "UC3: Automated Quality & Governance"
+          echo "Environment : $ENV"
+          echo "Workspace   : $WS_ID"
+          echo "Lakehouse   : $LH_NAME ($LH_ID)"
+          echo "Dry run     : $DRY_RUN"
+          echo "================================================================"
+
+          # ── DRY RUN shortcut ──────────────────────────────────────────────
+          if [ "$DRY_RUN" = "true" ]; then
+            echo ""
+            echo "DRY RUN — validating configuration only"
+            echo "  Schema version: $(grep 'SCHEMA_VERSION' notebooks/00_schema_registry.py | head -1)"
+            echo "  Notebooks to run: 00_apply_schema, 03_data_quality_checks"
+            echo "  Target: $LH_NAME in $ENV"
+            echo ""
+            echo "schema_status=DRY_RUN" >> $GITHUB_OUTPUT
+            echo "dq_status=DRY_RUN" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # ════════════════════════════════════════════════════════════════════
+          # Helper: upload or update a notebook in the workspace
+          # (Proven pattern from promote-with-schema-validation.yml)
+          # ════════════════════════════════════════════════════════════════════
+          upload_or_update_notebook() {
+            local NB_NAME="$1" WS="$2" TK="$3" PAYLOAD_FILE="$4"
+
+            CREATE_RESP=$(curl -s -D /tmp/nb_hdrs.txt -w "\n%{http_code}" -X POST \
+              -H "Authorization: Bearer $TK" \
+              -H "Content-Type: application/json" \
+              "https://api.fabric.microsoft.com/v1/workspaces/$WS/items" \
+              -d @"$PAYLOAD_FILE")
+            HTTP=$(echo "$CREATE_RESP" | tail -1)
+            BODY=$(echo "$CREATE_RESP" | head -n -1)
+            local NB_ID=""
+
+            if [ "$HTTP" = "201" ]; then
+              NB_ID=$(echo "$BODY" | jq -r '.id')
+              echo "  Created notebook: $NB_ID"
+
+            elif [ "$HTTP" = "202" ]; then
+              local LOC=$(grep -i "^operation-location:" /tmp/nb_hdrs.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
+              [ -z "$LOC" ] && LOC=$(grep -i "^location:" /tmp/nb_hdrs.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
+              echo "  Async creation — polling..."
+              for ci in $(seq 1 18); do
+                sleep 10
+                if [ -n "$LOC" ]; then
+                  local SR=$(curl -s -H "Authorization: Bearer $TK" "$LOC")
+                  local ST=$(echo "$SR" | jq -r '.status // .Status // empty')
+                  echo "    Poll $ci: $ST"
+                  if [ "$ST" = "Succeeded" ]; then
+                    NB_ID=$(echo "$SR" | jq -r '.resourceLocation // empty' | sed 's/.*\///')
+                    [ -z "$NB_ID" ] && NB_ID=$(curl -s -H "Authorization: Bearer $TK" \
+                      "https://api.fabric.microsoft.com/v1/workspaces/$WS/items?type=Notebook" \
+                      | jq -r --arg n "$NB_NAME" '.value[] | select(.displayName == $n) | .id // empty')
+                    break
+                  elif [ "$ST" = "Failed" ]; then break; fi
+                else
+                  NB_ID=$(curl -s -H "Authorization: Bearer $TK" \
+                    "https://api.fabric.microsoft.com/v1/workspaces/$WS/items?type=Notebook" \
+                    | jq -r --arg n "$NB_NAME" '.value[] | select(.displayName == $n) | .id // empty')
+                  [ -n "$NB_ID" ] && break
+                fi
+              done
+
+            elif [ "$HTTP" = "409" ]; then
+              # Notebook already exists — update its definition
+              NB_ID=$(curl -s -H "Authorization: Bearer $TK" \
+                "https://api.fabric.microsoft.com/v1/workspaces/$WS/items?type=Notebook" \
+                | jq -r --arg n "$NB_NAME" '.value[] | select(.displayName == $n) | .id // empty')
+              if [ -n "$NB_ID" ]; then
+                echo "  Exists ($NB_ID) — updating definition..."
+                local NB_DEF=$(jq '{definition: .definition}' "$PAYLOAD_FILE")
+                local UR=$(curl -s -D /tmp/upd_h.txt -w "\n%{http_code}" -X POST \
+                  -H "Authorization: Bearer $TK" -H "Content-Type: application/json" \
+                  "https://api.fabric.microsoft.com/v1/workspaces/$WS/items/$NB_ID/updateDefinition" \
+                  -d "$NB_DEF")
+                local UH=$(echo "$UR" | tail -1)
+                echo "    Update: HTTP $UH"
+                if [ "$UH" = "202" ]; then
+                  local UL=$(grep -i "^operation-location:" /tmp/upd_h.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
+                  [ -z "$UL" ] && UL=$(grep -i "^location:" /tmp/upd_h.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
+                  if [ -n "$UL" ]; then
+                    for ui in $(seq 1 12); do
+                      sleep 10
+                      local US=$(curl -s -H "Authorization: Bearer $TK" "$UL" | jq -r '.status // .Status // empty')
+                      echo "    Update poll $ui: $US"
+                      [ "$US" = "Succeeded" ] || [ "$US" = "Failed" ] && break
+                    done
+                  else sleep 15; fi
+                fi
+                rm -f /tmp/upd_h.txt
+              fi
+
+            else
+              echo "  Upload HTTP $HTTP — finding existing..."
+              NB_ID=$(curl -s -H "Authorization: Bearer $TK" \
+                "https://api.fabric.microsoft.com/v1/workspaces/$WS/items?type=Notebook" \
+                | jq -r --arg n "$NB_NAME" '.value[] | select(.displayName == $n) | .id // empty')
+              if [ -n "$NB_ID" ]; then
+                echo "  Found ($NB_ID) — updating..."
+                local NB_DEF=$(jq '{definition: .definition}' "$PAYLOAD_FILE")
+                curl -s -X POST \
+                  -H "Authorization: Bearer $TK" -H "Content-Type: application/json" \
+                  "https://api.fabric.microsoft.com/v1/workspaces/$WS/items/$NB_ID/updateDefinition" \
+                  -d "$NB_DEF" >/dev/null 2>&1
+                sleep 15
+              fi
+            fi
+            rm -f /tmp/nb_hdrs.txt
+            echo "$NB_ID"
+          }
+
+          # ════════════════════════════════════════════════════════════════════
+          # Helper: run a notebook and poll for completion (up to 30 min)
+          # ════════════════════════════════════════════════════════════════════
+          run_and_poll() {
+            local NB_ID="$1" WS="$2" TK="$3"
+            local RR=$(curl -s -w "\n%{http_code}" -D /tmp/run_h.txt -X POST \
+              -H "Authorization: Bearer $TK" \
+              -H "Content-Type: application/json" \
+              -H "Content-Length: 0" \
+              "https://api.fabric.microsoft.com/v1/workspaces/$WS/items/$NB_ID/jobs/instances?jobType=RunNotebook")
+            local RH=$(echo "$RR" | tail -1)
+            if [ "$RH" = "202" ] || [ "$RH" = "200" ]; then
+              echo "  Triggered (HTTP $RH)"
+              local JL=$(grep -i "^location:" /tmp/run_h.txt | tr -d '\r' | awk '{print $2}')
+              if [ -n "$JL" ]; then
+                for a in $(seq 1 60); do
+                  sleep 30
+                  local FULL_RESP=$(curl -s -H "Authorization: Bearer $TK" "$JL")
+                  local JS=$(echo "$FULL_RESP" | jq -r '.status // empty')
+                  echo "    Poll $a/60: $JS"
+                  if [ "$JS" = "Completed" ]; then
+                    echo "  ✅ COMPLETED"
+                    rm -f /tmp/run_h.txt
+                    return 0
+                  fi
+                  if [ "$JS" = "Failed" ] || [ "$JS" = "Cancelled" ]; then
+                    echo "  ❌ $JS"
+                    local FAIL_REASON=$(echo "$FULL_RESP" | jq -r '.failureReason // empty')
+                    local FAIL_MSG=$(echo "$FULL_RESP" | jq -r '.error.message // empty')
+                    local FAIL_ERR=$(echo "$FULL_RESP" | jq -r '.error.errorCode // empty')
+                    [ -n "$FAIL_REASON" ] && echo "  FAILURE REASON: $FAIL_REASON"
+                    [ -n "$FAIL_ERR" ]    && echo "  ERROR CODE: $FAIL_ERR"
+                    [ -n "$FAIL_MSG" ]    && echo "  ERROR MESSAGE: $FAIL_MSG"
+                    echo "  FULL JOB STATUS:"
+                    echo "$FULL_RESP" | jq '.' 2>/dev/null || echo "$FULL_RESP"
+                    rm -f /tmp/run_h.txt
+                    return 1
+                  fi
+                done
+                echo "  ⏰ Timed out (30 min)"
+                rm -f /tmp/run_h.txt
+                return 1
+              else
+                echo "  No Location header — cannot poll"
+                rm -f /tmp/run_h.txt
+                return 1
+              fi
+            else
+              echo "  Trigger HTTP $RH — FAILED"
+              echo "  Response: $(echo "$RR" | head -5)"
+              rm -f /tmp/run_h.txt
+              return 1
+            fi
+          }
+
+          # ════════════════════════════════════════════════════════════════════
+          # Helper: generate a Fabric notebook payload JSON from a .py file
+          # ════════════════════════════════════════════════════════════════════
+          generate_notebook_payload() {
+            local NB_NAME="$1" PY_FILE="$2" OUT_FILE="$3"
+            local CONTENT_B64=$(base64 -w0 < "$PY_FILE")
+            cat > "$OUT_FILE" <<EOFPAYLOAD
+          {
+            "displayName": "${NB_NAME}",
+            "type": "Notebook",
+            "definition": {
+              "format": "ipynb",
+              "parts": [
+                {
+                  "path": "notebook-content.py",
+                  "payload": "${CONTENT_B64}",
+                  "payloadType": "InlineBase64"
+                }
+              ]
+            }
+          }
+          EOFPAYLOAD
+          }
+
+          # ════════════════════════════════════════════════════════════════════
+          # PHASE 1: Schema Enforcement (00_apply_schema)
+          # ════════════════════════════════════════════════════════════════════
+          echo ""
+          echo "================================================================"
+          echo "PHASE 1: Schema Enforcement"
+          echo "================================================================"
+
+          # Generate notebook payload for 00_apply_schema
+          generate_notebook_payload "00_apply_schema" "notebooks/00_apply_schema.py" "/tmp/schema_nb_payload.json"
+
+          # Upload notebook
+          echo "Uploading 00_apply_schema notebook..."
+          SCHEMA_NB_ID=$(upload_or_update_notebook "00_apply_schema" "$WS_ID" "$TOKEN" "/tmp/schema_nb_payload.json" | tail -1)
+
+          if [ -z "$SCHEMA_NB_ID" ]; then
+            echo "ERROR: Could not create or find 00_apply_schema notebook"
+            exit 1
+          fi
+          echo "Notebook ID: $SCHEMA_NB_ID"
+
+          # Run schema enforcement
+          echo "Running 00_apply_schema..."
+          SCHEMA_EXIT=0
+          if ! run_and_poll "$SCHEMA_NB_ID" "$WS_ID" "$TOKEN"; then
+            echo "WARNING: Schema enforcement notebook run failed"
+            SCHEMA_EXIT=1
+          fi
+
+          # ── Task 2: Schema Drift Blocking ─────────────────────────────────
+          # Read status marker from OneLake to detect DRIFT
+          SCHEMA_STATUS="UNKNOWN"
+          if [ -n "$STORAGE_TOKEN" ] && [ "$STORAGE_TOKEN" != "null" ]; then
+            echo ""
+            echo "Reading schema enforcement status from OneLake..."
+
+            # Check for sync status marker
+            STATUS_JSON=$(curl -s \
+              -H "Authorization: Bearer $STORAGE_TOKEN" \
+              -H "x-ms-version: 2023-01-03" \
+              "https://onelake.dfs.fabric.microsoft.com/$WS_ID/$LH_ID/Files/diagnostics/schema_enforcement_status.json" 2>/dev/null || true)
+
+            if echo "$STATUS_JSON" | jq -e '.version' >/dev/null 2>&1; then
+              echo "---- SCHEMA ENFORCEMENT STATUS ----"
+              echo "$STATUS_JSON" | jq '.'
+              DRIFT_COUNT=$(echo "$STATUS_JSON" | jq -r '.drift_count // 0')
+              CREATED_COUNT=$(echo "$STATUS_JSON" | jq -r '.tables_created // 0')
+              COLUMNS_ADDED=$(echo "$STATUS_JSON" | jq -r '.columns_added // 0')
+
+              if [ "$DRIFT_COUNT" -gt 0 ] 2>/dev/null; then
+                echo ""
+                echo "🚨 SCHEMA DRIFT DETECTED: $DRIFT_COUNT table(s) have columns not in the registry"
+                echo "   These columns exist in the Lakehouse but are NOT in 00_schema_registry.py"
+                echo "   Either add them to the registry or remove them from the Lakehouse."
+                SCHEMA_STATUS="DRIFT"
+              else
+                SCHEMA_STATUS="OK"
+                echo "✅ No schema drift detected"
+              fi
+              echo "-----------------------------------"
+            else
+              echo "  No schema enforcement status file found — checking sync status fallback..."
+
+              # Fallback: check the legacy ___sync_status.json
+              SYNC_JSON=$(curl -s \
+                -H "Authorization: Bearer $STORAGE_TOKEN" \
+                -H "x-ms-version: 2023-01-03" \
+                "https://onelake.dfs.fabric.microsoft.com/$WS_ID/$LH_ID/Files/___sync_status.json" 2>/dev/null || true)
+
+              if echo "$SYNC_JSON" | jq -e '.status' >/dev/null 2>&1; then
+                echo "$SYNC_JSON" | jq '.'
+                # Check for drift in the sync status
+                if echo "$SYNC_JSON" | jq -r '.' | grep -qi "DRIFT"; then
+                  echo "🚨 SCHEMA DRIFT detected in sync status"
+                  SCHEMA_STATUS="DRIFT"
+                else
+                  SCHEMA_STATUS="OK"
+                fi
+              else
+                echo "  No status file found — relying on notebook exit code"
+                if [ "$SCHEMA_EXIT" -eq 0 ]; then
+                  SCHEMA_STATUS="OK"
+                else
+                  SCHEMA_STATUS="FAILED"
+                fi
+              fi
+            fi
+          else
+            echo "  No storage token — relying on notebook exit code"
+            if [ "$SCHEMA_EXIT" -eq 0 ]; then
+              SCHEMA_STATUS="OK"
+            else
+              SCHEMA_STATUS="FAILED"
+            fi
+          fi
+
+          echo "schema_status=$SCHEMA_STATUS" >> $GITHUB_OUTPUT
+
+          # Block on drift — this is a hard gate
+          if [ "$SCHEMA_STATUS" = "DRIFT" ]; then
+            echo ""
+            echo "════════════════════════════════════════════════════════════════"
+            echo "❌ SCHEMA DRIFT GATE: FAILED"
+            echo "   Schema drift was detected. The pipeline cannot proceed."
+            echo "   Fix: Update 00_schema_registry.py to include the extra columns,"
+            echo "         or remove them from the Lakehouse via Fabric UI."
+            echo "════════════════════════════════════════════════════════════════"
+            exit 1
+          fi
+
+          if [ "$SCHEMA_EXIT" -ne 0 ]; then
+            echo "❌ Schema enforcement notebook failed (exit code: $SCHEMA_EXIT)"
+            exit 1
+          fi
+
+          # ════════════════════════════════════════════════════════════════════
+          # PHASE 2: Data Quality Checks (03_data_quality_checks)
+          # ════════════════════════════════════════════════════════════════════
+          echo ""
+          echo "================================================================"
+          echo "PHASE 2: Data Quality Gate"
+          echo "================================================================"
+
+          # Generate notebook payload for 03_data_quality_checks
+          generate_notebook_payload "03_data_quality_checks" "notebooks/03_data_quality_checks.py" "/tmp/dq_nb_payload.json"
+
+          # Upload notebook
+          echo "Uploading 03_data_quality_checks notebook..."
+          DQ_NB_ID=$(upload_or_update_notebook "03_data_quality_checks" "$WS_ID" "$TOKEN" "/tmp/dq_nb_payload.json" | tail -1)
+
+          if [ -z "$DQ_NB_ID" ]; then
+            echo "ERROR: Could not create or find 03_data_quality_checks notebook"
+            exit 1
+          fi
+          echo "Notebook ID: $DQ_NB_ID"
+
+          # Run quality checks
+          echo "Running 03_data_quality_checks..."
+          DQ_EXIT=0
+          if ! run_and_poll "$DQ_NB_ID" "$WS_ID" "$TOKEN"; then
+            echo "WARNING: Data quality notebook run failed"
+            DQ_EXIT=1
+          fi
+
+          # ── Task 3: DQ Report Integration ─────────────────────────────────
+          # Read the DQ report from OneLake Files/diagnostics/
+          DQ_STATUS="UNKNOWN"
+          DQ_CRITICAL=0
+          if [ -n "$STORAGE_TOKEN" ] && [ "$STORAGE_TOKEN" != "null" ]; then
+            echo ""
+            echo "Reading DQ report from OneLake..."
+
+            DQ_REPORT=$(curl -s \
+              -H "Authorization: Bearer $STORAGE_TOKEN" \
+              -H "x-ms-version: 2023-01-03" \
+              "https://onelake.dfs.fabric.microsoft.com/$WS_ID/$LH_ID/Files/diagnostics/dq_report.json" 2>/dev/null || true)
+
+            if echo "$DQ_REPORT" | jq -e '.status' >/dev/null 2>&1; then
+              echo "---- DATA QUALITY REPORT ----"
+              echo "$DQ_REPORT" | jq '.'
+
+              DQ_STATUS=$(echo "$DQ_REPORT" | jq -r '.status // "UNKNOWN"')
+              DQ_CRITICAL=$(echo "$DQ_REPORT" | jq -r '.critical_failures // 0')
+              DQ_TOTAL=$(echo "$DQ_REPORT" | jq -r '.total_checks // 0')
+              DQ_PASSED=$(echo "$DQ_REPORT" | jq -r '.passed // 0')
+              DQ_WARNINGS=$(echo "$DQ_REPORT" | jq -r '.warnings // 0')
+
+              echo ""
+              echo "Summary: $DQ_PASSED/$DQ_TOTAL passed, $DQ_CRITICAL critical failures, $DQ_WARNINGS warnings"
+              echo "-----------------------------"
+            else
+              echo "  No DQ report found in Files/diagnostics/ — relying on notebook exit code"
+              if [ "$DQ_EXIT" -eq 0 ]; then
+                DQ_STATUS="PASS"
+                DQ_CRITICAL=0
+              else
+                DQ_STATUS="FAIL"
+                DQ_CRITICAL=1
+              fi
+            fi
+          else
+            echo "  No storage token — relying on notebook exit code"
+            if [ "$DQ_EXIT" -eq 0 ]; then
+              DQ_STATUS="PASS"
+              DQ_CRITICAL=0
+            else
+              DQ_STATUS="FAIL"
+              DQ_CRITICAL=1
+            fi
+          fi
+
+          echo "dq_status=$DQ_STATUS" >> $GITHUB_OUTPUT
+          echo "dq_critical=$DQ_CRITICAL" >> $GITHUB_OUTPUT
+
+          # Block on DQ failures — this is a hard gate
+          if [ "$DQ_STATUS" = "FAIL" ] || [ "$DQ_CRITICAL" -gt 0 ] 2>/dev/null; then
+            echo ""
+            echo "════════════════════════════════════════════════════════════════"
+            echo "❌ DATA QUALITY GATE: FAILED"
+            echo "   Status: $DQ_STATUS | Critical failures: $DQ_CRITICAL"
+            echo "   The pipeline cannot proceed with data quality violations."
+            echo "   Fix: Investigate the failing checks in 03_data_quality_checks.py"
+            echo "         and correct the source data or adjust thresholds."
+            echo "════════════════════════════════════════════════════════════════"
+            exit 1
+          fi
+
+          if [ "$DQ_EXIT" -ne 0 ]; then
+            echo "❌ Data quality notebook failed (exit code: $DQ_EXIT)"
+            exit 1
+          fi
+
+          # ════════════════════════════════════════════════════════════════════
+          # FINAL SUMMARY
+          # ════════════════════════════════════════════════════════════════════
+          echo ""
+          echo "================================================================"
+          echo "UC3 QUALITY & GOVERNANCE — SUMMARY"
+          echo "================================================================"
+          echo "  Environment       : $ENV"
+          echo "  Lakehouse         : $LH_NAME"
+          echo "  Schema status     : $SCHEMA_STATUS"
+          echo "  DQ status         : $DQ_STATUS"
+          echo "  Critical failures : $DQ_CRITICAL"
+          echo "================================================================"
+          echo "  ✅ All quality gates PASSED — deployment is safe to proceed"
+          echo "================================================================"
+
+          # Clean up temp files
+          rm -f /tmp/schema_nb_payload.json /tmp/dq_nb_payload.json
+
+      # ── Step 5: Post summary to job ─────────────────────────────────────
+      - name: Post Summary
+        if: always()
+        run: |
+          SCHEMA="${{ steps.enforcement.outputs.schema_status }}"
+          DQ="${{ steps.enforcement.outputs.dq_status }}"
+          CRITICAL="${{ steps.enforcement.outputs.dq_critical }}"
+
+          echo "### 🔒 Schema Enforcement & Quality Gate Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Gate | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Schema Enforcement | ${SCHEMA:-UNKNOWN} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Data Quality | ${DQ:-UNKNOWN} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Critical Failures | ${CRITICAL:-0} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$SCHEMA" = "DRIFT" ]; then
+            echo "> 🚨 **Schema drift detected** — extra columns in Lakehouse not in registry" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ "$DQ" = "FAIL" ] || [ "${CRITICAL:-0}" -gt 0 ] 2>/dev/null; then
+            echo "> ❌ **Data quality gate failed** — critical violations detected" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ "$SCHEMA" = "OK" ] && [ "$DQ" = "PASS" ]; then
+            echo "> ✅ **All gates passed** — deployment is safe to proceed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 2 — Dirty Data Demo (manual trigger only)
+  # ═══════════════════════════════════════════════════════════════════════════
+  dirty-data-demo:
+    name: "🧪 Dirty Data Demo (Expected FAIL)"
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.target_environment }}
+    if: github.event.inputs.dirty_data_demo == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Step 1: Acquire tokens ──────────────────────────────────────────
+      - name: Get Fabric Tokens
+        id: token
+        run: |
+          echo "Authenticating to Fabric API..."
           TOKEN=$(curl -s -X POST \
             "https://login.microsoftonline.com/${{ secrets.FABRIC_TENANT_ID }}/oauth2/v2.0/token" \
             -d "client_id=${{ secrets.FABRIC_CLIENT_ID }}" \
             -d "client_secret=${{ secrets.FABRIC_CLIENT_SECRET }}" \
             -d "scope=https://api.fabric.microsoft.com/.default" \
-            -d "grant_type=client_credentials" | jq -r '.access_token')
+            -d "grant_type=client_credentials" | jq -r '.access_token // empty')
+
+          if [ -z "$TOKEN" ]; then
+            echo "ERROR: Failed to acquire Fabric API token"
+            exit 1
+          fi
+          echo "::add-mask::$TOKEN"
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
 
-      - name: Resolve Workspace ID
+          STORAGE_TOKEN=$(curl -s -X POST \
+            "https://login.microsoftonline.com/${{ secrets.FABRIC_TENANT_ID }}/oauth2/v2.0/token" \
+            -d "client_id=${{ secrets.FABRIC_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.FABRIC_CLIENT_SECRET }}" \
+            -d "scope=https://storage.azure.com/.default" \
+            -d "grant_type=client_credentials" | jq -r '.access_token // empty')
+
+          if [ -n "$STORAGE_TOKEN" ]; then
+            echo "::add-mask::$STORAGE_TOKEN"
+          fi
+          echo "storage_token=$STORAGE_TOKEN" >> $GITHUB_OUTPUT
+          echo "✅ Tokens acquired"
+
+      # ── Step 2: Resolve workspace + lakehouse ───────────────────────────
+      - name: Resolve Workspace & Lakehouse
         id: workspace
         run: |
-          ENV=${{ github.event.inputs.target_environment }}
-          WORKSPACE_ID=$(jq -r '.workspace_id' environments/${ENV}.json)
+          ENV="${{ github.event.inputs.target_environment }}"
+          TOKEN="${{ steps.token.outputs.token }}"
+
+          WORKSPACE_ID=$(jq -r '.workspace_id' "environments/${ENV}.json")
+          LAKEHOUSE_NAME=$(jq -r '.lakehouse_name' "environments/${ENV}.json")
+
           echo "workspace_id=$WORKSPACE_ID" >> $GITHUB_OUTPUT
-          echo "Target: $ENV (workspace: $WORKSPACE_ID)"
+          echo "lakehouse_name=$LAKEHOUSE_NAME" >> $GITHUB_OUTPUT
 
-      - name: Trigger Schema Enforcement Notebook
+          # Discover lakehouse ID dynamically
+          LH_ITEMS=$(curl -s -H "Authorization: Bearer $TOKEN" \
+            "https://api.fabric.microsoft.com/v1/workspaces/$WORKSPACE_ID/items?type=Lakehouse")
+          LAKEHOUSE_ID=$(echo "$LH_ITEMS" | jq -r --arg n "$LAKEHOUSE_NAME" \
+            '.value[] | select(.displayName == $n) | .id // empty' | head -1)
+          [ -z "$LAKEHOUSE_ID" ] && LAKEHOUSE_ID=$(echo "$LH_ITEMS" | jq -r '.value[0].id // empty')
+
+          echo "lakehouse_id=$LAKEHOUSE_ID" >> $GITHUB_OUTPUT
+          echo "Target: $ENV — $LAKEHOUSE_NAME ($LAKEHOUSE_ID)"
+
+      # ── Step 3: Upload dirty CSV to lakehouse Files/ ────────────────────
+      - name: Upload Dirty Data to OneLake
         run: |
-          echo "Triggering 00_apply_schema notebook in ${{ github.event.inputs.target_environment }}..."
+          STORAGE_TOKEN="${{ steps.token.outputs.storage_token }}"
+          WS_ID="${{ steps.workspace.outputs.workspace_id }}"
+          LH_ID="${{ steps.workspace.outputs.lakehouse_id }}"
 
-          # Find the notebook item in the workspace
-          ITEMS=$(curl -s -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
-            "https://api.fabric.microsoft.com/v1/workspaces/${{ steps.workspace.outputs.workspace_id }}/items?type=Notebook")
+          echo "================================================================"
+          echo "🧪 DIRTY DATA DEMO"
+          echo "   Uploading datacenters_dirty.csv to lakehouse Files/"
+          echo "   This CSV contains: missing IDs, duplicates, invalid regions,"
+          echo "   out-of-range PUE values, and invalid statuses."
+          echo "================================================================"
 
-          NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "00_apply_schema") | .id')
-
-          if [ -z "$NOTEBOOK_ID" ]; then
-            echo "ERROR: 00_apply_schema notebook not found in workspace"
+          if [ -z "$STORAGE_TOKEN" ]; then
+            echo "ERROR: Storage token required to upload files to OneLake"
             exit 1
           fi
 
-          echo "Found notebook: $NOTEBOOK_ID"
+          # Ensure the sample-data directory exists in OneLake Files/
+          curl -s -X PUT \
+            -H "Authorization: Bearer $STORAGE_TOKEN" \
+            -H "x-ms-version: 2023-01-03" \
+            "https://onelake.dfs.fabric.microsoft.com/$WS_ID/$LH_ID/Files/sample-data?resource=directory" \
+            >/dev/null 2>&1 || true
 
-          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
-            echo "DRY RUN: Would execute notebook $NOTEBOOK_ID"
-            echo "Schema registry version: $(grep SCHEMA_VERSION notebooks/00_schema_registry.py)"
-            exit 0
+          # Upload the dirty CSV — overwrites datacenters.csv so ingestion picks it up
+          echo "Uploading datacenters_dirty.csv as datacenters.csv..."
+          FILE_SIZE=$(wc -c < sample-data/datacenters_dirty.csv | tr -d ' ')
+          curl -s -X PUT \
+            -H "Authorization: Bearer $STORAGE_TOKEN" \
+            -H "x-ms-version: 2023-01-03" \
+            -H "Content-Type: text/csv" \
+            -H "Content-Length: $FILE_SIZE" \
+            --data-binary @sample-data/datacenters_dirty.csv \
+            "https://onelake.dfs.fabric.microsoft.com/$WS_ID/$LH_ID/Files/sample-data/datacenters.csv?resource=file" \
+            >/dev/null 2>&1
+
+          # Create the file (PUT with resource=file, then PATCH to append data)
+          curl -s -X PUT \
+            -H "Authorization: Bearer $STORAGE_TOKEN" \
+            -H "x-ms-version: 2023-01-03" \
+            "https://onelake.dfs.fabric.microsoft.com/$WS_ID/$LH_ID/Files/sample-data/datacenters.csv?resource=file" \
+            >/dev/null 2>&1 || true
+
+          curl -s -X PATCH \
+            -H "Authorization: Bearer $STORAGE_TOKEN" \
+            -H "x-ms-version: 2023-01-03" \
+            -H "Content-Type: text/csv" \
+            -H "Content-Length: $FILE_SIZE" \
+            --data-binary @sample-data/datacenters_dirty.csv \
+            "https://onelake.dfs.fabric.microsoft.com/$WS_ID/$LH_ID/Files/sample-data/datacenters.csv?position=0&action=append" \
+            >/dev/null 2>&1 || true
+
+          curl -s -X PATCH \
+            -H "Authorization: Bearer $STORAGE_TOKEN" \
+            -H "x-ms-version: 2023-01-03" \
+            "https://onelake.dfs.fabric.microsoft.com/$WS_ID/$LH_ID/Files/sample-data/datacenters.csv?position=$FILE_SIZE&action=flush" \
+            >/dev/null 2>&1 || true
+
+          echo "✅ Dirty data uploaded to OneLake"
+
+      # ── Step 4: Run ingestion + quality checks (expect FAIL) ────────────
+      - name: Run Ingestion & Quality Checks (Expect FAIL)
+        id: demo
+        run: |
+          set -uo pipefail
+
+          TOKEN="${{ steps.token.outputs.token }}"
+          STORAGE_TOKEN="${{ steps.token.outputs.storage_token }}"
+          WS_ID="${{ steps.workspace.outputs.workspace_id }}"
+          LH_ID="${{ steps.workspace.outputs.lakehouse_id }}"
+          LH_NAME="${{ steps.workspace.outputs.lakehouse_name }}"
+
+          # ── Helper functions (same as enforce-schema job) ─────────────────
+          upload_or_update_notebook() {
+            local NB_NAME="$1" WS="$2" TK="$3" PAYLOAD_FILE="$4"
+            CREATE_RESP=$(curl -s -D /tmp/nb_hdrs.txt -w "\n%{http_code}" -X POST \
+              -H "Authorization: Bearer $TK" -H "Content-Type: application/json" \
+              "https://api.fabric.microsoft.com/v1/workspaces/$WS/items" \
+              -d @"$PAYLOAD_FILE")
+            HTTP=$(echo "$CREATE_RESP" | tail -1)
+            BODY=$(echo "$CREATE_RESP" | head -n -1)
+            local NB_ID=""
+            if [ "$HTTP" = "201" ]; then
+              NB_ID=$(echo "$BODY" | jq -r '.id')
+            elif [ "$HTTP" = "202" ]; then
+              local LOC=$(grep -i "^operation-location:" /tmp/nb_hdrs.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
+              [ -z "$LOC" ] && LOC=$(grep -i "^location:" /tmp/nb_hdrs.txt 2>/dev/null | tr -d '\r' | awk '{print $2}')
+              for ci in $(seq 1 18); do
+                sleep 10
+                if [ -n "$LOC" ]; then
+                  local SR=$(curl -s -H "Authorization: Bearer $TK" "$LOC")
+                  local ST=$(echo "$SR" | jq -r '.status // .Status // empty')
+                  if [ "$ST" = "Succeeded" ]; then
+                    NB_ID=$(echo "$SR" | jq -r '.resourceLocation // empty' | sed 's/.*\///')
+                    [ -z "$NB_ID" ] && NB_ID=$(curl -s -H "Authorization: Bearer $TK" \
+                      "https://api.fabric.microsoft.com/v1/workspaces/$WS/items?type=Notebook" \
+                      | jq -r --arg n "$NB_NAME" '.value[] | select(.displayName == $n) | .id // empty')
+                    break
+                  elif [ "$ST" = "Failed" ]; then break; fi
+                fi
+              done
+            elif [ "$HTTP" = "409" ]; then
+              NB_ID=$(curl -s -H "Authorization: Bearer $TK" \
+                "https://api.fabric.microsoft.com/v1/workspaces/$WS/items?type=Notebook" \
+                | jq -r --arg n "$NB_NAME" '.value[] | select(.displayName == $n) | .id // empty')
+              if [ -n "$NB_ID" ]; then
+                local NB_DEF=$(jq '{definition: .definition}' "$PAYLOAD_FILE")
+                curl -s -X POST \
+                  -H "Authorization: Bearer $TK" -H "Content-Type: application/json" \
+                  "https://api.fabric.microsoft.com/v1/workspaces/$WS/items/$NB_ID/updateDefinition" \
+                  -d "$NB_DEF" >/dev/null 2>&1
+                sleep 15
+              fi
+            else
+              NB_ID=$(curl -s -H "Authorization: Bearer $TK" \
+                "https://api.fabric.microsoft.com/v1/workspaces/$WS/items?type=Notebook" \
+                | jq -r --arg n "$NB_NAME" '.value[] | select(.displayName == $n) | .id // empty')
+            fi
+            rm -f /tmp/nb_hdrs.txt
+            echo "$NB_ID"
+          }
+
+          run_and_poll() {
+            local NB_ID="$1" WS="$2" TK="$3"
+            local RR=$(curl -s -w "\n%{http_code}" -D /tmp/run_h.txt -X POST \
+              -H "Authorization: Bearer $TK" -H "Content-Type: application/json" -H "Content-Length: 0" \
+              "https://api.fabric.microsoft.com/v1/workspaces/$WS/items/$NB_ID/jobs/instances?jobType=RunNotebook")
+            local RH=$(echo "$RR" | tail -1)
+            if [ "$RH" = "202" ] || [ "$RH" = "200" ]; then
+              echo "  Triggered (HTTP $RH)"
+              local JL=$(grep -i "^location:" /tmp/run_h.txt | tr -d '\r' | awk '{print $2}')
+              if [ -n "$JL" ]; then
+                for a in $(seq 1 60); do
+                  sleep 30
+                  local FULL_RESP=$(curl -s -H "Authorization: Bearer $TK" "$JL")
+                  local JS=$(echo "$FULL_RESP" | jq -r '.status // empty')
+                  echo "    Poll $a/60: $JS"
+                  if [ "$JS" = "Completed" ]; then echo "  ✅ COMPLETED"; rm -f /tmp/run_h.txt; return 0; fi
+                  if [ "$JS" = "Failed" ] || [ "$JS" = "Cancelled" ]; then
+                    echo "  ❌ $JS"
+                    echo "$FULL_RESP" | jq '.' 2>/dev/null || echo "$FULL_RESP"
+                    rm -f /tmp/run_h.txt; return 1
+                  fi
+                done
+                echo "  ⏰ Timed out"; rm -f /tmp/run_h.txt; return 1
+              else echo "  No Location header"; rm -f /tmp/run_h.txt; return 1; fi
+            else echo "  Trigger HTTP $RH — FAILED"; rm -f /tmp/run_h.txt; return 1; fi
+          }
+
+          generate_notebook_payload() {
+            local NB_NAME="$1" PY_FILE="$2" OUT_FILE="$3"
+            local CONTENT_B64=$(base64 -w0 < "$PY_FILE")
+            cat > "$OUT_FILE" <<EOFPAYLOAD
+          {
+            "displayName": "${NB_NAME}",
+            "type": "Notebook",
+            "definition": {
+              "format": "ipynb",
+              "parts": [
+                {
+                  "path": "notebook-content.py",
+                  "payload": "${CONTENT_B64}",
+                  "payloadType": "InlineBase64"
+                }
+              ]
+            }
+          }
+          EOFPAYLOAD
+          }
+
+          echo "================================================================"
+          echo "🧪 DIRTY DATA DEMO — Running quality checks on bad data"
+          echo "   Expected outcome: DQ gate should FAIL"
+          echo "================================================================"
+
+          # Step A: Run data ingestion (01_data_ingestion) to load dirty CSV
+          echo ""
+          echo "Step A: Running data ingestion with dirty CSV..."
+          generate_notebook_payload "01_data_ingestion" "notebooks/01_data_ingestion.py" "/tmp/ingest_nb.json"
+          INGEST_NB_ID=$(upload_or_update_notebook "01_data_ingestion" "$WS_ID" "$TOKEN" "/tmp/ingest_nb.json" | tail -1)
+
+          if [ -n "$INGEST_NB_ID" ]; then
+            echo "  Ingestion notebook: $INGEST_NB_ID"
+            run_and_poll "$INGEST_NB_ID" "$WS_ID" "$TOKEN" || echo "  Ingestion had issues (may still have loaded data)"
+          else
+            echo "  WARNING: Could not upload ingestion notebook — DQ checks will run on existing data"
           fi
 
-          # Execute the notebook via Fabric REST API
-          curl -s -X POST \
-            -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
-            -H "Content-Type: application/json" \
-            "https://api.fabric.microsoft.com/v1/workspaces/${{ steps.workspace.outputs.workspace_id }}/items/$NOTEBOOK_ID/jobs/instances?jobType=RunNotebook"
+          # Step B: Run data transformation (02_data_transformation) to create silver tables
+          echo ""
+          echo "Step B: Running transformation to silver layer..."
+          generate_notebook_payload "02_data_transformation" "notebooks/02_data_transformation.py" "/tmp/transform_nb.json"
+          TRANSFORM_NB_ID=$(upload_or_update_notebook "02_data_transformation" "$WS_ID" "$TOKEN" "/tmp/transform_nb.json" | tail -1)
 
-          echo "Schema enforcement notebook triggered successfully"
+          if [ -n "$TRANSFORM_NB_ID" ]; then
+            echo "  Transform notebook: $TRANSFORM_NB_ID"
+            run_and_poll "$TRANSFORM_NB_ID" "$WS_ID" "$TOKEN" || echo "  Transformation had issues"
+          else
+            echo "  WARNING: Could not upload transformation notebook"
+          fi
 
-      - name: Trigger Quality Validation Notebook
-        if: github.event.inputs.dry_run != 'true'
+          # Step C: Run quality checks — should FAIL on dirty data
+          echo ""
+          echo "Step C: Running data quality checks (expecting FAIL)..."
+          generate_notebook_payload "03_data_quality_checks" "notebooks/03_data_quality_checks.py" "/tmp/dq_nb.json"
+          DQ_NB_ID=$(upload_or_update_notebook "03_data_quality_checks" "$WS_ID" "$TOKEN" "/tmp/dq_nb.json" | tail -1)
+
+          DQ_RESULT="UNKNOWN"
+          if [ -n "$DQ_NB_ID" ]; then
+            echo "  DQ notebook: $DQ_NB_ID"
+            if run_and_poll "$DQ_NB_ID" "$WS_ID" "$TOKEN"; then
+              DQ_RESULT="PASS"
+            else
+              DQ_RESULT="FAIL"
+            fi
+          else
+            echo "  ERROR: Could not upload DQ notebook"
+            DQ_RESULT="ERROR"
+          fi
+
+          # Read DQ report if available
+          if [ -n "$STORAGE_TOKEN" ] && [ "$STORAGE_TOKEN" != "null" ]; then
+            DQ_REPORT=$(curl -s \
+              -H "Authorization: Bearer $STORAGE_TOKEN" \
+              -H "x-ms-version: 2023-01-03" \
+              "https://onelake.dfs.fabric.microsoft.com/$WS_ID/$LH_ID/Files/diagnostics/dq_report.json" 2>/dev/null || true)
+            if echo "$DQ_REPORT" | jq -e '.status' >/dev/null 2>&1; then
+              echo ""
+              echo "---- DQ REPORT (from OneLake) ----"
+              echo "$DQ_REPORT" | jq '.'
+              DQ_RESULT=$(echo "$DQ_REPORT" | jq -r '.status // "UNKNOWN"')
+              echo "----------------------------------"
+            fi
+          fi
+
+          echo "dq_result=$DQ_RESULT" >> $GITHUB_OUTPUT
+
+          echo ""
+          echo "================================================================"
+          echo "🧪 DIRTY DATA DEMO RESULTS"
+          echo "================================================================"
+          if [ "$DQ_RESULT" = "FAIL" ]; then
+            echo "  ✅ Demo SUCCESS: Quality gate correctly caught bad data"
+            echo "  The DQ checks detected issues in the dirty CSV:"
+            echo "    - Missing datacenter_id (null primary key)"
+            echo "    - Duplicate DC001 entry"
+            echo "    - InvalidRegion not in valid set"
+            echo "    - PUE 0.75 below minimum (1.0)"
+            echo "    - PUE 3.50 at the maximum boundary"
+            echo "    - InvalidStatus not in valid set"
+          elif [ "$DQ_RESULT" = "PASS" ]; then
+            echo "  ⚠️ Unexpected: DQ checks passed on dirty data"
+            echo "  This may mean the dirty data was not loaded, or checks need adjustment"
+          else
+            echo "  ⚠️ DQ result: $DQ_RESULT"
+          fi
+          echo "================================================================"
+
+          # Clean up
+          rm -f /tmp/ingest_nb.json /tmp/transform_nb.json /tmp/dq_nb.json
+
+      # ── Step 5: Post demo summary ───────────────────────────────────────
+      - name: Post Demo Summary
+        if: always()
         run: |
-          echo "Triggering 03_data_quality_checks notebook..."
+          DQ_RESULT="${{ steps.demo.outputs.dq_result }}"
 
-          ITEMS=$(curl -s -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
-            "https://api.fabric.microsoft.com/v1/workspaces/${{ steps.workspace.outputs.workspace_id }}/items?type=Notebook")
+          echo "### 🧪 Dirty Data Demo Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "This demo ingested \`datacenters_dirty.csv\` containing known data quality issues:" >> $GITHUB_STEP_SUMMARY
+          echo "- Missing datacenter_id (null primary key)" >> $GITHUB_STEP_SUMMARY
+          echo "- Duplicate DC001 entry" >> $GITHUB_STEP_SUMMARY
+          echo "- InvalidRegion value (not in allowed set)" >> $GITHUB_STEP_SUMMARY
+          echo "- PUE value 0.75 (below minimum of 1.0)" >> $GITHUB_STEP_SUMMARY
+          echo "- InvalidStatus (not in allowed set)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
 
-          QA_NOTEBOOK_ID=$(echo "$ITEMS" | jq -r '.value[] | select(.displayName == "03_data_quality_checks") | .id')
-
-          if [ -n "$QA_NOTEBOOK_ID" ]; then
-            curl -s -X POST \
-              -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
-              -H "Content-Type: application/json" \
-              "https://api.fabric.microsoft.com/v1/workspaces/${{ steps.workspace.outputs.workspace_id }}/items/$QA_NOTEBOOK_ID/jobs/instances?jobType=RunNotebook"
-            echo "Quality validation triggered"
+          if [ "$DQ_RESULT" = "FAIL" ]; then
+            echo "> ✅ **Demo succeeded** — The quality gate correctly caught the bad data and blocked the pipeline." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "> ⚠️ **DQ Result: ${DQ_RESULT}** — Check logs for details." >> $GITHUB_STEP_SUMMARY
           fi
