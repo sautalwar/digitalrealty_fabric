@@ -11,7 +11,7 @@ on:
     inputs:
       workspace:
         description: 'Target workspace'
-        default: 'DigitalRealty_Dev'
+        default: 'DigitalRealty-Dev'
         type: string
 
 env:
@@ -24,140 +24,274 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: "Discovery: Auto-detect model files"
+        id: discovery
+        run: |
+          echo "============================================"
+          echo "  STEP 0: Auto-Detecting Model Files"
+          echo "============================================"
+          echo ""
+          echo "Searching repository for semantic model files..."
+          echo ""
+
+          TMDL_FILES=$(find . -name "*.tmdl" 2>/dev/null | sort)
+          PBIP_FILES=$(find . -name "*.pbip" 2>/dev/null | sort)
+          PBIR_FILES=$(find . -name "*.pbir" 2>/dev/null | sort)
+          PBIX_FILES=$(find . -name "*.pbix" 2>/dev/null | sort)
+          JSON_FILES=$(find . -name "*.json" -not -path "./.github/*" -not -path "./node_modules/*" 2>/dev/null | sort)
+
+          echo "  TMDL files found:"
+          if [ -n "$TMDL_FILES" ]; then
+            echo "$TMDL_FILES" | while read f; do echo "    [FOUND] $f ($(wc -l < "$f") lines)"; done
+          else
+            echo "    (none)"
+          fi
+
+          echo ""
+          echo "  PBIP files found:"
+          if [ -n "$PBIP_FILES" ]; then
+            echo "$PBIP_FILES" | while read f; do echo "    [FOUND] $f"; done
+          else
+            echo "    (none)"
+          fi
+
+          echo ""
+          echo "  PBIR files found:"
+          if [ -n "$PBIR_FILES" ]; then
+            echo "$PBIR_FILES" | while read f; do echo "    [FOUND] $f"; done
+          else
+            echo "    (none)"
+          fi
+
+          echo ""
+          echo "  PBIX files found:"
+          if [ -n "$PBIX_FILES" ]; then
+            echo "$PBIX_FILES" | while read f; do echo "    [FOUND] $f"; done
+          else
+            echo "    (none)"
+          fi
+
+          TMDL_COUNT=$(echo "$TMDL_FILES" | grep -c "." 2>/dev/null || echo "0")
+          PBIP_COUNT=$(echo "$PBIP_FILES" | grep -c "." 2>/dev/null || echo "0")
+
+          echo ""
+          echo "  Summary: $TMDL_COUNT TMDL, $PBIP_COUNT PBIP"
+          echo ""
+
+          if [ "$TMDL_COUNT" -eq "0" ] && [ "$PBIP_COUNT" -eq "0" ]; then
+            echo "::warning::No TMDL or PBIP files found — static checks will have nothing to scan"
+          fi
+          echo "============================================"
       
-      - name: Check for calculated columns
+      - name: "Performance: Check for calculated columns"
         id: calc-cols
         run: |
-          echo "=== Scanning TMDL for calculated columns ==="
-          CALC_COLS=$(grep -c "calculatedColumn" semantic-model/*.tmdl 2>/dev/null || echo "0")
-          echo "Found: $CALC_COLS calculated columns"
+          echo "============================================"
+          echo "  CHECK 1/11: Calculated Columns"
+          echo "  Looking for: calculatedColumn keyword in TMDL files"
+          echo "  Why: Calculated columns force DirectLake fallback to DirectQuery"
+          echo "============================================"
+          CALC_COLS=$(grep "calculatedColumn" semantic-model/*.tmdl 2>/dev/null | wc -l)
+          echo "  Scanning: semantic-model/*.tmdl"
+          echo "  Pattern:  calculatedColumn"
+          echo "  Found:    $CALC_COLS occurrences"
           if [ "$CALC_COLS" -gt "0" ]; then
+            echo ""
+            echo "  Details:"
+            grep -n "calculatedColumn" semantic-model/*.tmdl 2>/dev/null | while read line; do echo "    $line"; done
+            echo ""
             echo "::warning::Found $CALC_COLS calculated columns — consider converting to measures"
-            grep -n "calculatedColumn" semantic-model/*.tmdl || true
           fi
+          echo "  Verdict:  $([ "$CALC_COLS" -gt "0" ] && echo "WARN ($CALC_COLS found)" || echo "PASS")"
           echo "calc_col_count=$CALC_COLS" >> $GITHUB_OUTPUT
+          echo "============================================"
       
-      - name: Check for inefficient DAX patterns
+      - name: "Performance: Check for inefficient DAX patterns"
         run: |
-          echo "=== Scanning for known DAX anti-patterns ==="
+          echo "============================================"
+          echo "  CHECK 2/11: DAX Anti-Patterns"
+          echo "  Looking for: SUMX, FILTER(ALL()), AVERAGEX"
+          echo "  Why: Row iterators are slower than aggregations"
+          echo "============================================"
           ISSUES=0
           
-          # Check for SUMX where SUM would work
-          SUMX_COUNT=$(grep -c "SUMX(" semantic-model/*.tmdl 2>/dev/null || echo "0")
+          echo "  --- Scanning for SUMX ---"
+          SUMX_COUNT=$(grep "SUMX(" semantic-model/*.tmdl 2>/dev/null | wc -l)
+          echo "  Found: $SUMX_COUNT"
           if [ "$SUMX_COUNT" -gt "0" ]; then
+            grep -n "SUMX(" semantic-model/*.tmdl 2>/dev/null | while read line; do echo "    $line"; done
             echo "::warning::Found $SUMX_COUNT uses of SUMX — verify these can't use SUM instead"
-            grep -n "SUMX(" semantic-model/*.tmdl || true
             ISSUES=$((ISSUES + SUMX_COUNT))
           fi
           
-          # Check for FILTER(ALL(...)) pattern
-          FILTER_ALL=$(grep -c "FILTER(ALL(" semantic-model/*.tmdl 2>/dev/null || echo "0")
+          echo "  --- Scanning for FILTER(ALL()) ---"
+          FILTER_ALL=$(grep "FILTER(ALL(" semantic-model/*.tmdl 2>/dev/null | wc -l)
+          echo "  Found: $FILTER_ALL"
           if [ "$FILTER_ALL" -gt "0" ]; then
+            grep -n "FILTER(ALL(" semantic-model/*.tmdl 2>/dev/null | while read line; do echo "    $line"; done
             echo "::error::Found $FILTER_ALL uses of FILTER(ALL()) — replace with CALCULATE + REMOVEFILTERS"
-            grep -n "FILTER(ALL(" semantic-model/*.tmdl || true
             ISSUES=$((ISSUES + FILTER_ALL))
           fi
           
-          # Check for AVERAGEX where AVERAGE works
-          AVERAGEX_COUNT=$(grep -c "AVERAGEX(" semantic-model/*.tmdl 2>/dev/null || echo "0")
+          echo "  --- Scanning for AVERAGEX ---"
+          AVERAGEX_COUNT=$(grep "AVERAGEX(" semantic-model/*.tmdl 2>/dev/null | wc -l)
+          echo "  Found: $AVERAGEX_COUNT"
           if [ "$AVERAGEX_COUNT" -gt "0" ]; then
+            grep -n "AVERAGEX(" semantic-model/*.tmdl 2>/dev/null | while read line; do echo "    $line"; done
             echo "::warning::Found $AVERAGEX_COUNT uses of AVERAGEX — verify these can't use AVERAGE"
-            grep -n "AVERAGEX(" semantic-model/*.tmdl || true
             ISSUES=$((ISSUES + AVERAGEX_COUNT))
           fi
           
           echo ""
-          echo "Total DAX issues: $ISSUES"
+          echo "  Total DAX issues: $ISSUES"
           if [ "$ISSUES" -gt "5" ]; then
             echo "::error::Too many DAX anti-patterns ($ISSUES). Please optimize before merging."
+            echo "  Verdict: FAIL"
             exit 1
           fi
+          echo "  Verdict: $([ "$ISSUES" -gt "0" ] && echo "WARN ($ISSUES issues)" || echo "PASS")"
+          echo "============================================"
       
-      - name: Check for missing format strings
+      - name: "Performance: Check for missing format strings"
         run: |
-          echo "=== Checking measure format strings ==="
-          MEASURES=$(grep -c "measure " semantic-model/*.tmdl 2>/dev/null || echo "0")
-          FORMATTED=$(grep -c "formatString:" semantic-model/*.tmdl 2>/dev/null || echo "0")
-          echo "Measures: $MEASURES, With formatString: $FORMATTED"
+          echo "============================================"
+          echo "  CHECK 3/11: Format String Coverage"
+          echo "  Looking for: measures without formatString"
+          echo "  Why: Unformatted measures display raw decimals in reports"
+          echo "============================================"
+          MEASURES=$(grep "measure " semantic-model/*.tmdl 2>/dev/null | wc -l)
+          FORMATTED=$(grep "formatString:" semantic-model/*.tmdl 2>/dev/null | wc -l)
           MISSING=$((MEASURES - FORMATTED))
+          echo "  Measures found:      $MEASURES"
+          echo "  With formatString:   $FORMATTED"
+          echo "  Missing formatString: $MISSING"
           if [ "$MISSING" -gt "2" ]; then
             echo "::warning::$MISSING measures missing formatString"
+            echo "  Verdict: WARN ($MISSING missing)"
+          else
+            echo "  Verdict: PASS"
           fi
+          echo "============================================"
       
-      - name: Check for high-cardinality bloat columns
+      - name: "Performance: Check for high-cardinality bloat columns"
         run: |
-          echo "=== Checking for known bloat column patterns ==="
+          echo "============================================"
+          echo "  CHECK 4/11: Bloat Column Detection"
+          echo "  Looking for: description, notes, raw_, _hash, _etl_, response"
+          echo "  Why: High-cardinality text columns bloat model size"
+          echo "============================================"
           BLOAT_PATTERNS=("description" "notes" "raw_" "_hash" "_etl_" "response")
           FOUND=0
           for pattern in "${BLOAT_PATTERNS[@]}"; do
-            COUNT=$(grep -ci "$pattern" semantic-model/*.tmdl 2>/dev/null || echo "0")
+            COUNT=$(grep -i "$pattern" semantic-model/*.tmdl 2>/dev/null | wc -l)
             if [ "$COUNT" -gt "0" ]; then
+              echo "  Pattern '$pattern': $COUNT occurrences"
+              grep -in "$pattern" semantic-model/*.tmdl 2>/dev/null | while read line; do echo "    $line"; done
               echo "::warning::Found columns matching bloat pattern '$pattern' ($COUNT occurrences)"
               FOUND=$((FOUND + COUNT))
+            else
+              echo "  Pattern '$pattern': 0"
             fi
           done
-          echo "Potential bloat columns: $FOUND"
+          echo ""
+          echo "  Potential bloat columns: $FOUND"
+          echo "  Verdict: $([ "$FOUND" -gt "0" ] && echo "WARN ($FOUND found)" || echo "PASS")"
+          echo "============================================"
 
       # ── Security Guardrails ──
 
       - name: "Security: RLS Coverage Audit"
         id: rls-audit
         run: |
-          echo "=== RLS Coverage Audit ==="
+          echo "============================================"
+          echo "  CHECK 5/11: Row-Level Security (RLS) Audit"
+          echo "  Looking for: role and tablePermission blocks in TMDL"
+          echo "  Why: Without RLS, any report user sees ALL data"
+          echo "============================================"
           TMDL_DIR="semantic-model"
-          ROLES=$(grep -c "^  role " $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
-          echo "RLS roles defined: $ROLES"
+          echo "  Scanning: $TMDL_DIR/*.tmdl"
+          ROLES=$(grep "^  role " $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
+          echo "  RLS roles defined: $ROLES"
           if [ "$ROLES" -eq "0" ]; then
+            echo ""
+            echo "  [FAIL] ZERO RLS roles defined — all data is unprotected"
             echo "::error::ZERO RLS roles defined — all data is unprotected"
             echo "rls_status=FAIL" >> $GITHUB_OUTPUT
           else
-            # List all tables and check which have tablePermission
+            grep -n "^  role " $TMDL_DIR/*.tmdl 2>/dev/null | while read line; do echo "    Role: $line"; done
             TABLES=$(grep -oP "(?<=^  table )\S+" $TMDL_DIR/*.tmdl 2>/dev/null | sort -u)
             PROTECTED=$(grep -oP "(?<=tablePermission )\S+" $TMDL_DIR/*.tmdl 2>/dev/null | sort -u)
+            echo ""
+            echo "  Checking table-level RLS coverage:"
             UNPROTECTED=""
             for t in $TABLES; do
-              if ! echo "$PROTECTED" | grep -q "^${t}$"; then
+              if echo "$PROTECTED" | grep -q "^${t}$"; then
+                echo "    [PROTECTED] $t"
+              else
+                echo "    [EXPOSED]   $t — NO tablePermission in any role"
                 UNPROTECTED="$UNPROTECTED $t"
               fi
             done
             if [ -n "$UNPROTECTED" ]; then
+              echo ""
               echo "::warning::Tables WITHOUT RLS tablePermission:$UNPROTECTED"
+              echo "  Verdict: WARN (tables exposed:$UNPROTECTED)"
               echo "rls_status=WARN" >> $GITHUB_OUTPUT
             else
-              echo "All tables have RLS coverage"
+              echo "  Verdict: PASS (all tables have RLS coverage)"
               echo "rls_status=PASS" >> $GITHUB_OUTPUT
             fi
           fi
+          echo "============================================"
 
       - name: "Security: OLS Sensitive Column Guard"
         id: ols-guard
         run: |
-          echo "=== OLS Sensitive Column Guard ==="
+          echo "============================================"
+          echo "  CHECK 6/11: Object-Level Security (OLS) Guard"
+          echo "  Looking for: sensitive column names without columnPermission"
+          echo "  Why: Even with RLS, sensitive COLUMNS are visible to all users"
+          echo "============================================"
           TMDL_DIR="semantic-model"
+          echo "  Scanning: $TMDL_DIR/*.tmdl"
           SENSITIVE_PATTERNS="revenue|salary|cost|price|email|phone|ssn|address|credit|budget|pii|confidential|income|wage"
+          echo "  Sensitive patterns: $SENSITIVE_PATTERNS"
+          echo ""
           SENSITIVE_COLS=$(grep -iP "column\s+\S*($SENSITIVE_PATTERNS)" $TMDL_DIR/*.tmdl 2>/dev/null || true)
-          OLS_DEFINED=$(grep -c "columnPermission" $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
+          OLS_DEFINED=$(grep "columnPermission" $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
           
           if [ -n "$SENSITIVE_COLS" ]; then
             SENS_COUNT=$(echo "$SENSITIVE_COLS" | wc -l)
-            echo "Sensitive columns found: $SENS_COUNT"
-            echo "$SENSITIVE_COLS" | head -20
+            echo "  Sensitive columns found: $SENS_COUNT"
+            echo "$SENSITIVE_COLS" | while read line; do echo "    [SENSITIVE] $line"; done
+            echo ""
+            echo "  OLS (columnPermission) protections: $OLS_DEFINED"
             if [ "$OLS_DEFINED" -eq "0" ]; then
+              echo ""
+              echo "  [WARN] $SENS_COUNT sensitive columns but ZERO OLS defined"
               echo "::warning::$SENS_COUNT sensitive columns detected but ZERO OLS (columnPermission) defined"
+              echo "  Verdict: WARN"
               echo "ols_status=WARN" >> $GITHUB_OUTPUT
             else
-              echo "OLS protections found: $OLS_DEFINED"
+              echo "  Verdict: PASS"
               echo "ols_status=PASS" >> $GITHUB_OUTPUT
             fi
           else
-            echo "No sensitive column patterns detected"
+            echo "  No sensitive column patterns detected"
+            echo "  Verdict: PASS"
             echo "ols_status=PASS" >> $GITHUB_OUTPUT
           fi
+          echo "============================================"
 
       - name: "Security: Credential & Secret Scan"
         id: secret-scan
         run: |
-          echo "=== Credential & Secret Scan ==="
+          echo "============================================"
+          echo "  CHECK 7/11: Credential & Secret Scan"
+          echo "  Looking for: passwords, API keys, connection strings"
+          echo "  Why: Leaked credentials in Git expose the entire environment"
+          echo "============================================"
           PATTERNS=(
             "password="
             "secret="
@@ -170,123 +304,188 @@ jobs:
             "SharedAccessKey="
             "DefaultEndpointsProtocol="
           )
+          echo "  Scanning all TMDL, PBIP, JSON, PY, M, YML files..."
+          echo "  Excluding: .github/workflows/, node_modules/"
+          echo ""
           FOUND=0
           for pat in "${PATTERNS[@]}"; do
+            echo "  --- Pattern: '$pat' ---"
             HITS=$(grep -rn --include="*.tmdl" --include="*.pbip" --include="*.pbir" \
               --include="*.json" --include="*.py" --include="*.m" --include="*.yml" \
               -i "$pat" . 2>/dev/null | grep -v ".github/workflows" | grep -v "node_modules" || true)
             if [ -n "$HITS" ]; then
-              echo "::error::Pattern '$pat' found:"
-              echo "$HITS" | head -5
-              FOUND=$((FOUND + $(echo "$HITS" | wc -l)))
+              HIT_COUNT=$(echo "$HITS" | wc -l)
+              echo "    [ALERT] $HIT_COUNT matches:"
+              echo "$HITS" | head -5 | while read line; do echo "      $line"; done
+              echo "::error::Pattern '$pat' found in code"
+              FOUND=$((FOUND + HIT_COUNT))
+            else
+              echo "    Clean"
             fi
           done
+          echo ""
           if [ "$FOUND" -gt "0" ]; then
+            echo "  [FAIL] $FOUND credential/secret patterns detected"
             echo "::error::$FOUND credential/secret patterns detected — FAIL"
+            echo "  Verdict: FAIL"
             echo "secret_status=FAIL" >> $GITHUB_OUTPUT
           else
-            echo "No embedded credentials found"
+            echo "  No embedded credentials found"
+            echo "  Verdict: PASS"
             echo "secret_status=PASS" >> $GITHUB_OUTPUT
           fi
+          echo "============================================"
 
       - name: "Security: PBIP/TMDL Data Source Audit"
         id: datasource-audit
         run: |
-          echo "=== PBIP/TMDL Data Source Audit ==="
+          echo "============================================"
+          echo "  CHECK 8/11: Data Source Security Audit"
+          echo "  Looking for: HTTP endpoints, hardcoded IPs, connection strings"
+          echo "  Why: Unencrypted connections expose data in transit"
+          echo "============================================"
+          echo "  Searching for TMDL, PBIP, PBIR, JSON files..."
           FILES=$(find . -name "*.tmdl" -o -name "*.pbip" -o -name "*.pbir" \
             -o -name "*.json" 2>/dev/null | grep -v node_modules | grep -v ".github")
-          if [ -z "$FILES" ]; then
-            echo "No TMDL/PBIP files found — skipping"
+          FILE_COUNT=$(echo "$FILES" | grep -c "." 2>/dev/null || echo "0")
+          echo "  Files to scan: $FILE_COUNT"
+          if [ "$FILE_COUNT" -eq "0" ]; then
+            echo "  No TMDL/PBIP files found — skipping"
+            echo "  Verdict: SKIP"
             echo "datasource_status=SKIP" >> $GITHUB_OUTPUT
             exit 0
           fi
+          echo "$FILES" | while read f; do echo "    $f"; done
+          echo ""
           ISSUES=0
-          # Check for HTTP (non-HTTPS) data source endpoints
+          echo "  --- Checking for HTTP (non-HTTPS) endpoints ---"
           HTTP_HITS=$(echo "$FILES" | xargs grep -nP "http://[^/]" 2>/dev/null || true)
           if [ -n "$HTTP_HITS" ]; then
-            echo "::warning::Non-HTTPS endpoints detected:"
-            echo "$HTTP_HITS" | head -5
-            ISSUES=$((ISSUES + $(echo "$HTTP_HITS" | wc -l)))
+            HTTP_COUNT=$(echo "$HTTP_HITS" | wc -l)
+            echo "    [WARN] $HTTP_COUNT non-HTTPS endpoints:"
+            echo "$HTTP_HITS" | head -5 | while read line; do echo "      $line"; done
+            echo "::warning::Non-HTTPS endpoints detected"
+            ISSUES=$((ISSUES + HTTP_COUNT))
+          else
+            echo "    Clean"
           fi
-          # Check for hardcoded IP addresses in data sources
+          echo "  --- Checking for hardcoded IP addresses ---"
           IP_HITS=$(echo "$FILES" | xargs grep -nP "\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}" 2>/dev/null \
             | grep -v "0.0.0.0\|127.0.0.1\|version" || true)
           if [ -n "$IP_HITS" ]; then
-            echo "::warning::Hardcoded IP addresses detected:"
-            echo "$IP_HITS" | head -5
-            ISSUES=$((ISSUES + $(echo "$IP_HITS" | wc -l)))
+            IP_COUNT=$(echo "$IP_HITS" | wc -l)
+            echo "    [WARN] $IP_COUNT hardcoded IPs:"
+            echo "$IP_HITS" | head -5 | while read line; do echo "      $line"; done
+            echo "::warning::Hardcoded IP addresses detected"
+            ISSUES=$((ISSUES + IP_COUNT))
+          else
+            echo "    Clean"
           fi
+          echo ""
           if [ "$ISSUES" -gt "0" ]; then
-            echo "::warning::$ISSUES data source security issues found"
+            echo "  Verdict: WARN ($ISSUES issues)"
             echo "datasource_status=WARN" >> $GITHUB_OUTPUT
           else
-            echo "Data source security: clean"
+            echo "  Verdict: PASS"
             echo "datasource_status=PASS" >> $GITHUB_OUTPUT
           fi
+          echo "============================================"
 
       # ── Performance ──
 
       - name: "Performance: DirectLake Fallback Guard"
         id: directlake-guard
         run: |
-          echo "=== DirectLake Fallback Guard ==="
+          echo "============================================"
+          echo "  CHECK 9/11: DirectLake Fallback Guard"
+          echo "  Looking for: calculatedColumn, crossFilteringBehavior: Both"
+          echo "  Why: These silently force DirectQuery mode (10-100x slower)"
+          echo "============================================"
           TMDL_DIR="semantic-model"
-          CALC_COLS=$(grep -c "calculatedColumn" $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
-          BIDIR=$(grep -c "crossFilteringBehavior.*[Bb]oth" $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
+          echo "  Scanning: $TMDL_DIR/*.tmdl"
+          CALC_COLS=$(grep "calculatedColumn" $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
+          BIDIR=$(grep -i "crossFilteringBehavior.*both" $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
           FALLBACK_TRIGGERS=$((CALC_COLS + BIDIR))
-          echo "Calculated columns: $CALC_COLS"
-          echo "Bi-directional relationships: $BIDIR"
+          echo "  Calculated columns:        $CALC_COLS"
+          echo "  Bi-directional crossfilter: $BIDIR"
+          echo "  Total fallback triggers:    $FALLBACK_TRIGGERS"
           if [ "$FALLBACK_TRIGGERS" -gt "0" ]; then
+            echo ""
+            echo "  Details:"
+            grep -n "calculatedColumn" $TMDL_DIR/*.tmdl 2>/dev/null | while read line; do echo "    [CALC_COL] $line"; done
+            grep -in "crossFilteringBehavior.*both" $TMDL_DIR/*.tmdl 2>/dev/null | while read line; do echo "    [BIDIR]    $line"; done
+            echo ""
             echo "::error::$FALLBACK_TRIGGERS DirectLake fallback triggers found — these force DirectQuery mode (10-100x slower)"
-            [ "$CALC_COLS" -gt "0" ] && grep -n "calculatedColumn" $TMDL_DIR/*.tmdl || true
-            [ "$BIDIR" -gt "0" ] && grep -n "crossFilteringBehavior.*[Bb]oth" $TMDL_DIR/*.tmdl || true
+            echo "  Verdict: FAIL"
             echo "directlake_status=FAIL" >> $GITHUB_OUTPUT
           else
-            echo "No DirectLake fallback triggers — clean"
+            echo "  No DirectLake fallback triggers found"
+            echo "  Verdict: PASS"
             echo "directlake_status=PASS" >> $GITHUB_OUTPUT
           fi
+          echo "============================================"
 
       # ── Governance ──
 
       - name: "Governance: Description Coverage"
         id: desc-coverage
         run: |
-          echo "=== Description Coverage ==="
+          echo "============================================"
+          echo "  CHECK 10/11: Description Coverage"
+          echo "  Looking for: measures without description attributes"
+          echo "  Why: Undocumented measures create confusion for report builders"
+          echo "============================================"
           TMDL_DIR="semantic-model"
-          MEASURES=$(grep -c "measure " $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
-          DESCRIPTIONS=$(grep -c "description:" $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
+          echo "  Scanning: $TMDL_DIR/*.tmdl"
+          MEASURES=$(grep "measure " $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
+          DESCRIPTIONS=$(grep "description:" $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
           GAP=$((MEASURES - DESCRIPTIONS))
-          echo "Measures: $MEASURES, With descriptions: $DESCRIPTIONS, Gap: $GAP"
+          echo "  Measures found:     $MEASURES"
+          echo "  With description:   $DESCRIPTIONS"
+          echo "  Gap (undocumented): $GAP"
           if [ "$GAP" -gt "3" ]; then
+            echo ""
             echo "::warning::$GAP measures lack descriptions — governance gap"
+            echo "  Verdict: WARN ($GAP undocumented)"
             echo "desc_status=WARN" >> $GITHUB_OUTPUT
           else
-            echo "Description coverage is adequate"
+            echo "  Verdict: PASS"
             echo "desc_status=PASS" >> $GITHUB_OUTPUT
           fi
+          echo "============================================"
 
       - name: "Governance: Model Complexity Score"
         id: complexity
         run: |
-          echo "=== Model Complexity Score ==="
+          echo "============================================"
+          echo "  CHECK 11/11: Model Complexity Score"
+          echo "  Formula: tables + measures/5 + columns/10 + calc_cols*10 + relationships"
+          echo "  Threshold: WARN if score > 50"
+          echo "============================================"
           TMDL_DIR="semantic-model"
-          TABLES=$(grep -c "^  table " $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
-          MEASURES=$(grep -c "measure " $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
-          COLUMNS=$(grep -c "column " $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
-          CALC_COLS=$(grep -c "calculatedColumn" $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
-          RELATIONSHIPS=$(grep -c "relationship " $TMDL_DIR/*.tmdl 2>/dev/null || echo "0")
-          # Weighted score: calc columns penalized heavily
+          echo "  Scanning: $TMDL_DIR/*.tmdl"
+          TABLES=$(grep "^  table " $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
+          MEASURES=$(grep "measure " $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
+          COLUMNS=$(grep "column " $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
+          CALC_COLS=$(grep "calculatedColumn" $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
+          RELATIONSHIPS=$(grep "relationship " $TMDL_DIR/*.tmdl 2>/dev/null | wc -l)
+          echo "  Tables:         $TABLES"
+          echo "  Measures:       $MEASURES"
+          echo "  Columns:        $COLUMNS"
+          echo "  Calc columns:   $CALC_COLS (penalty: x10)"
+          echo "  Relationships:  $RELATIONSHIPS"
           SCORE=$((TABLES + MEASURES / 5 + COLUMNS / 10 + CALC_COLS * 10 + RELATIONSHIPS))
-          echo "Tables: $TABLES, Measures: $MEASURES, Columns: $COLUMNS"
-          echo "Calc columns: $CALC_COLS, Relationships: $RELATIONSHIPS"
-          echo "Complexity score: $SCORE (threshold: 50)"
+          echo ""
+          echo "  Complexity score: $SCORE (threshold: 50)"
           if [ "$SCORE" -gt "50" ]; then
             echo "::warning::Model complexity score $SCORE exceeds threshold — review for bloat"
+            echo "  Verdict: WARN (score $SCORE)"
             echo "complexity_status=WARN" >> $GITHUB_OUTPUT
           else
-            echo "Complexity within acceptable range"
+            echo "  Verdict: PASS"
             echo "complexity_status=PASS" >> $GITHUB_OUTPUT
           fi
+          echo "============================================"
 
   # Job 2: Schema Validation
   schema-check:
