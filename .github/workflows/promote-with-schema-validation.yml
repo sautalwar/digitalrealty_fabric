@@ -866,7 +866,7 @@ jobs:
               STATUS_JSON=$(curl -s \
                 -H "Authorization: Bearer $STORAGE_TOKEN_CACHED" \
                 -H "x-ms-version: 2023-01-03" \
-                "https://onelake.dfs.fabric.microsoft.com/$WS_ID/$UAT_LH_ID/Tables/___sync_status.json" 2>/dev/null || true)
+                "https://onelake.dfs.fabric.microsoft.com/$WS_ID/$UAT_LH_ID/Files/___sync_status.json" 2>/dev/null || true)
               if echo "$STATUS_JSON" | jq -e '.status' >/dev/null 2>&1; then
                 echo "  ---- SYNC STATUS MARKER ----"
                 echo "$STATUS_JSON" | jq '.'

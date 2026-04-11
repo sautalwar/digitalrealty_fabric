@@ -177,8 +177,8 @@ if has_source:
         "    try:\n"
         "        _sync_status['timestamp'] = _time.strftime('%Y-%m-%dT%H:%M:%SZ', _time.gmtime())\n"
         "        status_json = _json.dumps(_sync_status, indent=2)\n"
-        "        mssparkutils.fs.put('Tables/___sync_status.json', status_json, True)\n"
-        "        print(f'  Status marker written: Tables/___sync_status.json')\n"
+        "        mssparkutils.fs.put('Files/___sync_status.json', status_json, True)\n"
+        "        print(f'  Status marker written: Files/___sync_status.json')\n"
         "    except Exception as we:\n"
         "        print(f'  Status marker write failed (non-fatal): {we}')\n\n"
 
