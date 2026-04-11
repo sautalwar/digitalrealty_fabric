@@ -1,0 +1,16 @@
+deployment_id,customer_name,datacenter_id,contract_type,power_kw,cabinets,contract_start,contract_end,monthly_revenue_usd,status,connectivity_type,compliance_requirements
+DEP001,CloudScale Inc,DC001,Wholesale,2500,120,2020-01-01,2027-01-01,187500,Active,Dark Fiber,SOC2;ISO27001
+DEP002,FinServ Global,DC001,Retail,500,25,2021-06-15,2026-06-15,62500,Active,Cross Connect,SOC2;PCI-DSS;ISO27001
+DEP003,MegaCloud Corp,DC002,Hyperscale,8000,400,2022-01-01,2032-01-01,480000,Active,Dark Fiber,SOC2;ISO27001
+,Missing-Deployment,,Wholesale,3000,150,2021-03-01,2028-03-01,210000,Active,Dark Fiber,SOC2
+DEP001,CloudScale DUPE,DC001,Wholesale,2500,120,2020-01-01,2027-01-01,187500,Active,Dark Fiber,SOC2;ISO27001
+DEP006,AI Research Labs,DC003,Wholesale,-500,200,2023-01-15,2030-01-15,375000,Active,Dark Fiber,SOC2;ISO27001
+DEP007,EuroBank AG,DC005,Retail,800,40,2019-04-01,2026-04-01,120000,Active,Cross Connect,SOC2;PCI-DSS;GDPR
+DEP008,TelecomPlus UK,DC006,Wholesale,4000,200,2023-06-01,2030-06-01,320000,Active,Dark Fiber,SOC2;ISO27001
+DEP009,AutoDrive GmbH,DC007,Wholesale,6000,300,2022-09-01,2029-09-01,-10000,Active,Dark Fiber,SOC2;ISO27001;GDPR
+DEP010,CloudConnect DE,DC007,Retail,1200,60,2023-03-15,2028-03-15,108000,Active,Cross Connect,SOC2;GDPR
+DEP011,APAC Streaming,DC008,Retail,600,30,2021-01-01,2026-12-31,54000,Expiring,Cross Connect,SOC2
+DEP012,NipponTech Corp,DC009,Wholesale,3500,175,2020-08-01,2027-08-01,315000,Active,Dark Fiber,SOC2;ISO27001
+DEP013,,DC010,Retail,400,20,2022-10-01,2027-10-01,40000,Active,Cross Connect,SOC2
+DEP014,DataNow BV,DC011,Hyperscale,10000,500,2023-07-01,2033-07-01,650000,Active,Dark Fiber,SOC2;ISO27001;GDPR
+DEP015,LatamCloud SA,DC013,Retail,300,15,2021-09-01,2026-09-01,27000,InvalidRisk,Cross Connect,SOC2

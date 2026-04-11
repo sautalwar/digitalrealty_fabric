@@ -1,0 +1,16 @@
+datacenter_id,datacenter_name,market,region,country,facility_type,total_power_mw,it_power_mw,pue,status,opened_date,tier_level
+DC001,DFW10,Dallas,NorthAmerica,United States,Colocation,32.0,28.0,1.25,Active,2019-03-15,Tier III
+DC002,DFW11,Dallas,NorthAmerica,United States,Colocation,48.0,42.0,1.22,Active,2021-06-01,Tier III
+DC003,IAD38,Ashburn,NorthAmerica,United States,Hyperscale,64.0,56.0,1.18,Active,2022-01-10,Tier IV
+,Missing-ID-Site,Dallas,NorthAmerica,United States,Colocation,20.0,18.0,1.30,Active,2020-01-01,Tier III
+DC001,DFW10-DUPLICATE,Dallas,NorthAmerica,United States,Colocation,32.0,28.0,1.25,Active,2019-03-15,Tier III
+DC006,LHR14,London,EMEA,United Kingdom,Colocation,36.0,30.0,1.24,Active,2023-03-01,Tier III
+DC007,FRA15,Frankfurt,InvalidRegion,Germany,Hyperscale,52.0,45.0,1.20,Active,2021-11-15,Tier IV
+DC008,SIN12,Singapore,APAC,Singapore,Colocation,20.0,16.0,0.75,Active,2020-04-10,Tier III
+DC009,NRT14,Tokyo,APAC,Japan,Colocation,28.0,24.0,3.50,Active,2019-09-25,Tier III
+DC010,SYD11,Sydney,APAC,Australia,Colocation,18.0,15.0,1.32,Active,2022-08-15,Tier III
+DC011,AMS17,Amsterdam,EMEA,Netherlands,Hyperscale,44.0,38.0,1.19,Active,2023-06-01,Tier IV
+DC012,ORD10,Chicago,NorthAmerica,United States,Colocation,30.0,26.0,1.26,Active,2020-02-28,Tier III
+DC013,GRU11,Sao Paulo,LATAM,Brazil,Colocation,16.0,13.0,1.38,Active,2021-01-15,Tier III
+DC014,HKG12,Hong Kong,APAC,China,Colocation,22.0,18.0,1.33,InvalidStatus,2019-12-01,Tier III
+DC015,MRS10,Marseille,EMEA,France,Subsea Hub,40.0,34.0,1.21,Active,2022-05-20,Tier IV
